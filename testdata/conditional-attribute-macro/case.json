@@ -1,0 +1,14 @@
+{
+  "mustContain": [
+    "#[cfg(transformed)]",
+    "#[cfg(not(transformed))]",
+    "mod dependency;",
+    "pub const VALUE: &str = \"dependency\";"
+  ],
+  "mustContainCount": { "mod dependency;": 1, "mod dependency {": 1 },
+  "mustIncludeFiles": ["dependency.rs"],
+  "runtimeChecks": [
+    {},
+    { "rustcArgs": ["--cfg", "transformed"], "shouldCompile": false }
+  ]
+}

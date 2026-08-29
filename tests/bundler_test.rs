@@ -17,9 +17,6 @@ struct BundleScenario {
     max_source_files: usize,
     #[serde(rename = "noInlineIncludes")]
     no_inline_includes: bool,
-    cfg: Vec<String>,
-    #[serde(rename = "useDefaultCfg")]
-    use_default_cfg: Option<bool>,
     environment: HashMap<String, String>,
     #[serde(rename = "shouldFail")]
     should_fail: bool,
@@ -47,6 +44,8 @@ struct BundleScenario {
     rustc_args: Vec<String>,
     #[serde(rename = "rustcEnvironment")]
     rustc_environment: HashMap<String, String>,
+    #[serde(rename = "runtimeChecks")]
+    runtime_checks: Vec<RuntimeCheck>,
     #[serde(rename = "skipOutputCheck")]
     skip_output_check: bool,
 }
@@ -74,32 +73,61 @@ struct ExpectedSource {
     file: String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct RuntimeCheck {
+    #[serde(rename = "rustcArgs")]
+    rustc_args: Vec<String>,
+    #[serde(rename = "rustcEnvironment")]
+    rustc_environment: HashMap<String, String>,
+    #[serde(rename = "shouldCompile")]
+    should_compile: Option<bool>,
+}
+
+struct RuntimeJob {
+    scenario_name: String,
+    project_root: PathBuf,
+    check_name: String,
+    entry: String,
+    edition: String,
+    rustc_args: Vec<String>,
+    rustc_environment: HashMap<String, String>,
+    should_compile: Option<bool>,
+}
+
 #[test]
 fn test_bundle_file() {
     let scenario_names = discover_scenario_names();
+    run_in_parallel(&scenario_names, |scenario_name| {
+        let scenario_path = testdata_root().join(scenario_name);
+        let project_root = scenario_project_root(&scenario_path);
+        let scenario = load_scenario(&scenario_path);
+        execute_scenario(scenario_name, &scenario_path, &project_root, &scenario);
+    });
+    let runtime_jobs = build_runtime_jobs(&scenario_names);
+    run_in_parallel(&runtime_jobs, check_runtime_output);
+}
+
+fn run_in_parallel<T: Sync>(items: &[T], task: impl Fn(&T) + Sync) {
     let worker_count = std::thread::available_parallelism()
         .map_or(1, |count| count.get())
-        .min(scenario_names.len());
-    let next_scenario = AtomicUsize::new(0);
-
+        .min(items.len());
+    let next_item = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let workers = (0..worker_count)
             .map(|_| {
+                let task = &task;
                 scope.spawn(|| {
                     loop {
-                        let index = next_scenario.fetch_add(1, Ordering::Relaxed);
-                        let Some(scenario_name) = scenario_names.get(index) else {
+                        let index = next_item.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(index) else {
                             return;
                         };
-                        let scenario_path = testdata_root().join(scenario_name);
-                        let project_root = scenario_project_root(&scenario_path);
-                        let scenario = load_scenario(&scenario_path);
-                        execute_scenario(scenario_name, &scenario_path, &project_root, &scenario);
+                        task(item);
                     }
                 })
             })
             .collect::<Vec<_>>();
-
         for worker in workers {
             if let Err(payload) = worker.join() {
                 std::panic::resume_unwind(payload);
@@ -121,8 +149,6 @@ fn execute_scenario(
             max_source_files: scenario.max_source_files,
             inline_includes: !scenario.no_inline_includes,
             external: scenario.external.clone(),
-            cfg: scenario.cfg.clone(),
-            use_default_cfg: scenario.use_default_cfg.unwrap_or(true),
             environment: scenario
                 .environment
                 .iter()
@@ -148,10 +174,48 @@ fn execute_scenario(
     write_bundled_output(scenario_path, &result.code);
     check_source_expectations(scenario_name, scenario, &result.bundled_source_list);
     check_code_expectations(scenario_name, scenario, &result.code);
+}
 
-    if !scenario.skip_output_check {
-        check_runtime_output(scenario_name, project_root, scenario);
+fn build_runtime_jobs(scenario_names: &[String]) -> Vec<RuntimeJob> {
+    let mut jobs = Vec::new();
+    for scenario_name in scenario_names {
+        let scenario_path = testdata_root().join(scenario_name);
+        let project_root = scenario_project_root(&scenario_path);
+        let scenario = load_scenario(&scenario_path);
+        if scenario.should_fail || scenario.skip_output_check {
+            continue;
+        }
+        if scenario.runtime_checks.is_empty() {
+            jobs.push(RuntimeJob {
+                scenario_name: scenario_name.clone(),
+                project_root,
+                check_name: "default".to_owned(),
+                entry: scenario.entry,
+                edition: scenario.edition,
+                rustc_args: scenario.rustc_args,
+                rustc_environment: scenario.rustc_environment,
+                should_compile: None,
+            });
+        } else {
+            assert!(
+                scenario.rustc_args.is_empty() && scenario.rustc_environment.is_empty(),
+                "{scenario_name} cannot combine rustcArgs/rustcEnvironment with runtimeChecks"
+            );
+            for (index, check) in scenario.runtime_checks.iter().enumerate() {
+                jobs.push(RuntimeJob {
+                    scenario_name: scenario_name.clone(),
+                    project_root: project_root.clone(),
+                    check_name: format!("runtimeChecks[{index}]"),
+                    entry: scenario.entry.clone(),
+                    edition: scenario.edition.clone(),
+                    rustc_args: check.rustc_args.clone(),
+                    rustc_environment: check.rustc_environment.clone(),
+                    should_compile: check.should_compile,
+                });
+            }
+        }
     }
+    jobs
 }
 
 fn check_source_expectations(
@@ -322,47 +386,72 @@ fn write_bundled_output(scenario_path: &Path, code: &str) {
     });
 }
 
-fn check_runtime_output(scenario_name: &str, project_root: &Path, scenario: &BundleScenario) {
-    let output_root = temporary_test_dir(scenario_name);
+fn check_runtime_output(job: &RuntimeJob) {
+    let output_root = temporary_test_dir(&job.scenario_name);
     fs::create_dir_all(&output_root).expect("create test output directory");
-    let rustc_args = scenario
+    let rustc_args = job
         .rustc_args
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    let environment = scenario
+    let environment = job
         .rustc_environment
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect::<Vec<_>>();
     let original = compile_and_run(
-        &project_root.join(&scenario.entry),
-        &output_root.join(executable_name("original")),
-        &scenario.edition,
+        &job.project_root.join(&job.entry),
+        &output_root.join(executable_name(&format!("original-{}", job.check_name))),
+        &job.edition,
         &rustc_args,
         &environment,
     );
     let bundled = compile_and_run(
-        &project_root.join("bundled.rs"),
-        &output_root.join(executable_name("bundled")),
-        &scenario.edition,
+        &job.project_root.join("bundled.rs"),
+        &output_root.join(executable_name(&format!("bundled-{}", job.check_name))),
+        &job.edition,
         &rustc_args,
         &environment,
     );
     assert_eq!(
-        original.status.success(),
-        bundled.status.success(),
-        "runtime status mismatch for {scenario_name}"
+        original.is_ok(),
+        bundled.is_ok(),
+        "compile status mismatch for {} {}\noriginal:\n{}\nbundled:\n{}",
+        job.scenario_name,
+        job.check_name,
+        compile_stderr(&original),
+        compile_stderr(&bundled)
     );
-    assert!(
-        original.status.success(),
-        "original {scenario_name} failed:\n{}",
-        String::from_utf8_lossy(&original.stderr)
-    );
+    let should_compile = job.should_compile.unwrap_or(true);
     assert_eq!(
-        original.stdout, bundled.stdout,
-        "stdout mismatch for {scenario_name}"
+        original.is_ok(),
+        should_compile,
+        "unexpected compile status for {} {}\n{}",
+        job.scenario_name,
+        job.check_name,
+        compile_stderr(&original)
     );
+    if let (Ok(original), Ok(bundled)) = (original, bundled) {
+        assert_eq!(
+            original.status.success(),
+            bundled.status.success(),
+            "runtime status mismatch for {} {}",
+            job.scenario_name,
+            job.check_name
+        );
+        assert!(
+            original.status.success(),
+            "original {} {} failed:\n{}",
+            job.scenario_name,
+            job.check_name,
+            String::from_utf8_lossy(&original.stderr)
+        );
+        assert_eq!(
+            original.stdout, bundled.stdout,
+            "stdout mismatch for {} {}",
+            job.scenario_name, job.check_name
+        );
+    }
 }
 
 fn compile_and_run(
@@ -371,7 +460,7 @@ fn compile_and_run(
     edition: &str,
     rustc_args: &[&str],
     environment: &[(&str, &str)],
-) -> Output {
+) -> Result<Output, Output> {
     let mut command = Command::new("rustc");
     command
         .arg(format!("--edition={edition}"))
@@ -386,15 +475,19 @@ fn compile_and_run(
     let compile = command
         .output()
         .unwrap_or_else(|error| panic!("run rustc for {}: {error}", source.display()));
-    assert!(
-        compile.status.success(),
-        "compile {}:\n{}",
-        source.display(),
-        String::from_utf8_lossy(&compile.stderr)
-    );
+    if !compile.status.success() {
+        return Err(compile);
+    }
     Command::new(executable)
         .output()
-        .unwrap_or_else(|error| panic!("run {}: {error}", executable.display()))
+        .map_err(|error| panic!("run {}: {error}", executable.display()))
+}
+
+fn compile_stderr(result: &Result<Output, Output>) -> String {
+    match result {
+        Ok(_) => String::new(),
+        Err(output) => String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
 }
 
 fn parse_edition(edition: &str, scenario_path: &Path) -> RustEdition {

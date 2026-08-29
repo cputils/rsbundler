@@ -48,7 +48,7 @@ Source is not printed back from an abstract syntax tree. Only the exact ranges t
 - qualified standard macros and explicit aliases such as `std::include_str!` and `use std::include_str as embedded`
 - direct `file!`, `line!`, and `column!` calls, including explicit standard aliases, replaced with their original values before source is moved
 - statically parseable module and include dependencies in `macro_rules!` transcribers
-- target-aware `cfg`, `all`, `any`, `not`, and nested `cfg_attr` evaluation
+- target-independent expansion of `cfg`, `all`, `any`, `not`, and nested `cfg_attr` branches
 - UTF-8 BOMs and shebangs in source files
 - transactional cycle detection and a configurable dependency-file limit
 
@@ -73,9 +73,9 @@ const SCHEMA: &str = include_str!(SCHEMA_PATH); // no-bundle
 
 ### Conditional compilation
 
-rsbundler evaluates conditional attributes before resolving dependencies. By default, the target cfg values used to compile the rsbundler executable are embedded in that executable and used without invoking a compiler at runtime. Repeat `--cfg name` or `--cfg 'key="value"'` to add application-specific values. For a cross-target bundle, pass `--no-default-cfg` and the complete desired cfg set.
+rsbundler never selects a compilation target and does not use the cfg values with which its own executable was compiled. It retains the original conditional attributes and expands every dependency branch that can be resolved statically. Predicates that are inherently false, such as `any()`, are skipped without reading their dependencies.
 
-Inactive dependencies remain unchanged and are not read. Active `cfg_attr(..., path = "...")` values participate in normal Rust module resolution. Attributes remain in the generated source, but the inlined body is specific to the cfg set selected while bundling; compile the bundle with the same cfg set.
+When `cfg_attr(..., path = "...")` can select different files for one module, rsbundler emits mutually exclusive `#[cfg(...)]` inline-module branches for every selected path and for the default module path. This produces one bundle that the Rust compiler can use with any cfg set. A missing, ambiguous, cyclic, generated, or otherwise unsafe candidate remains as the original out-of-line declaration only under its corresponding condition; other candidates are still expanded. If multiple path attributes can be active simultaneously, that overlap branch is retained unchanged so rustc keeps control of its own overlap diagnostics and precedence behavior. Nested `cfg_attr`, conditional attribute macros, path-changing inline ancestors, and each candidate's distinct child-module base are handled in the same way.
 
 ## Accuracy boundaries
 
@@ -102,8 +102,6 @@ pybundler's interpreter/sys.path boundary option has no Rust equivalent because 
 | `--edition <EDITION>`        | Parse as Rust `2015`, `2018`, `2021`, or `2024`                 | `2024`          |
 | `--max-source-files <COUNT>` | Limit expanded module and include files, excluding the entry    | `2048`          |
 | `-e, --external <MODULE>`    | Retain a top-level module; repeatable                           | none            |
-| `--cfg <SPEC>`               | Add `name` or `key=value` to the active cfg set; repeatable     | none            |
-| `--no-default-cfg`           | Omit cfg values embedded for rsbundler's build target           | disabled        |
 | `--env <KEY=VALUE>`          | Set an `env!` value used in a statically evaluated include path | process env     |
 | `--no-inline-includes`       | Leave all three built-in include macro forms in generated code  | disabled        |
 
@@ -130,7 +128,7 @@ std::fs::write("bundled.rs", result.code)?;
 
 `BundleResult` also contains the canonical entry path and deterministic metadata for every module or include file used in the bundle.
 
-`BundleOptions` exposes the corresponding `external`, `cfg`, `use_default_cfg`, and `environment` fields in addition to edition, source-file limit, and include control. Environment values supplied in options take precedence over the rsbundler process environment.
+`BundleOptions` exposes the corresponding `external` and `environment` fields in addition to edition, source-file limit, and include control. Environment values supplied in options take precedence over the rsbundler process environment.
 
 ## License
 

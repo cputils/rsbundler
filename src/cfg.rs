@@ -1,145 +1,127 @@
-use std::collections::HashSet;
 use std::path::Path;
 
-use ra_ap_syntax::{AstNode, AstToken, Edition, SyntaxNode, ast, ast::HasAttrs, ast::LiteralKind};
+use ra_ap_syntax::{AstNode, SyntaxNode, ast, ast::HasAttrs};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub(super) enum CfgAtom {
-    Flag(String),
-    KeyValue(String, String),
+pub(super) enum CfgExpr {
+    True,
+    False,
+    Atom(String),
+    All(Vec<Self>),
+    Any(Vec<Self>),
+    Not(Box<Self>),
 }
 
-pub(super) fn parse_cfg_spec(spec: &str) -> Result<CfgAtom, String> {
-    let spec = spec.trim();
-    if spec.is_empty() {
-        return Err("cfg option must not be empty".to_owned());
-    }
-    let (key, value) = match spec.split_once('=') {
-        Some((key, value)) => (key.trim(), Some(value.trim())),
-        None => (spec, None),
-    };
-    if !is_cfg_identifier(key) {
-        return Err(format!("invalid cfg option {spec:?}: invalid name {key:?}"));
-    }
-    let Some(value) = value else {
-        return Ok(CfgAtom::Flag(key.to_owned()));
-    };
-    if value.is_empty() {
-        return Err(format!(
-            "invalid cfg option {spec:?}: value must not be empty"
-        ));
-    }
-    let value = if value.starts_with('"') {
-        let parsed = ast::Expr::parse(value, Edition::Edition2024);
-        if !parsed.errors().is_empty() {
-            return Err(format!("invalid cfg option {spec:?}: invalid string value"));
-        }
-        match parsed.tree() {
-            ast::Expr::Literal(literal) => match literal.kind() {
-                LiteralKind::String(string) => string
-                    .value()
-                    .map_err(|error| format!("invalid cfg option {spec:?}: {error:?}"))?
-                    .into_owned(),
-                _ => return Err(format!("invalid cfg option {spec:?}: invalid string value")),
-            },
-            _ => return Err(format!("invalid cfg option {spec:?}: invalid string value")),
-        }
-    } else {
-        value.to_owned()
-    };
-    Ok(CfgAtom::KeyValue(key.to_owned(), value))
-}
-
-fn is_cfg_identifier(value: &str) -> bool {
-    let mut chars = value.chars();
-    chars
-        .next()
-        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
-        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
-}
-
-pub(super) fn syntax_is_active(
-    node: &SyntaxNode,
-    cfg: &HashSet<CfgAtom>,
-    file_path: &Path,
-) -> Result<bool, String> {
-    for ancestor in node.ancestors() {
-        let Some(owner) = ast::AnyHasAttrs::cast(ancestor) else {
-            continue;
-        };
-        for attr in owner.attrs() {
-            if let Some(meta) = attr.meta()
-                && !meta_keeps_owner(meta, cfg, file_path)?
-            {
-                return Ok(false);
+impl CfgExpr {
+    pub(super) fn all(expressions: impl IntoIterator<Item = Self>) -> Self {
+        let mut flattened = Vec::new();
+        for expression in expressions {
+            match expression {
+                Self::True => {}
+                Self::False => return Self::False,
+                Self::All(nested) => flattened.extend(nested),
+                expression => flattened.push(expression),
             }
         }
+        deduplicate(&mut flattened);
+        if contains_complement(&flattened) {
+            return Self::False;
+        }
+        match flattened.len() {
+            0 => Self::True,
+            1 => flattened.pop().expect("one cfg expression"),
+            _ => Self::All(flattened),
+        }
     }
-    Ok(true)
+
+    pub(super) fn any(expressions: impl IntoIterator<Item = Self>) -> Self {
+        let mut flattened = Vec::new();
+        for expression in expressions {
+            match expression {
+                Self::False => {}
+                Self::True => return Self::True,
+                Self::Any(nested) => flattened.extend(nested),
+                expression => flattened.push(expression),
+            }
+        }
+        deduplicate(&mut flattened);
+        if contains_complement(&flattened) {
+            return Self::True;
+        }
+        match flattened.len() {
+            0 => Self::False,
+            1 => flattened.pop().expect("one cfg expression"),
+            _ => Self::Any(flattened),
+        }
+    }
+
+    pub(super) fn not(self) -> Self {
+        match self {
+            Self::True => Self::False,
+            Self::False => Self::True,
+            Self::Not(expression) => *expression,
+            expression => Self::Not(Box::new(expression)),
+        }
+    }
+
+    pub(super) fn is_true(&self) -> bool {
+        matches!(self, Self::True)
+    }
+
+    pub(super) fn is_false(&self) -> bool {
+        matches!(self, Self::False)
+    }
+
+    pub(super) fn render(&self) -> String {
+        match self {
+            Self::True => "all()".to_owned(),
+            Self::False => "any()".to_owned(),
+            Self::Atom(atom) => atom.clone(),
+            Self::All(expressions) => render_composite("all", expressions),
+            Self::Any(expressions) => render_composite("any", expressions),
+            Self::Not(expression) => format!("not({})", expression.render()),
+        }
+    }
 }
 
-fn meta_keeps_owner(
-    meta: ast::Meta,
-    cfg: &HashSet<CfgAtom>,
-    file_path: &Path,
-) -> Result<bool, String> {
-    match meta {
-        ast::Meta::CfgMeta(meta) => {
-            let predicate = meta.cfg_predicate().ok_or_else(|| {
-                format!("{}: cfg attribute has no predicate", file_path.display())
-            })?;
-            eval_cfg_predicate(predicate, cfg, file_path)
+fn deduplicate(expressions: &mut Vec<CfgExpr>) {
+    let mut index = 0;
+    while index < expressions.len() {
+        if expressions[..index].contains(&expressions[index]) {
+            expressions.remove(index);
+        } else {
+            index += 1;
         }
-        ast::Meta::CfgAttrMeta(meta) => {
-            let predicate = meta.cfg_predicate().ok_or_else(|| {
-                format!(
-                    "{}: cfg_attr attribute has no predicate",
-                    file_path.display()
-                )
-            })?;
-            if !eval_cfg_predicate(predicate, cfg, file_path)? {
-                return Ok(true);
-            }
-            for nested in meta.metas() {
-                if !meta_keeps_owner(nested, cfg, file_path)? {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
-        _ => Ok(true),
     }
 }
 
-pub(super) fn eval_cfg_predicate(
+fn contains_complement(expressions: &[CfgExpr]) -> bool {
+    expressions.iter().any(|expression| match expression {
+        CfgExpr::Not(inner) => expressions.contains(inner),
+        expression => expressions.contains(&CfgExpr::Not(Box::new(expression.clone()))),
+    })
+}
+
+fn render_composite(operator: &str, expressions: &[CfgExpr]) -> String {
+    format!(
+        "{operator}({})",
+        expressions
+            .iter()
+            .map(CfgExpr::render)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+pub(super) fn cfg_predicate_expression(
     predicate: ast::CfgPredicate,
-    cfg: &HashSet<CfgAtom>,
     file_path: &Path,
-) -> Result<bool, String> {
+) -> Result<CfgExpr, String> {
     match predicate {
         ast::CfgPredicate::CfgAtom(atom) => match atom.key() {
-            Some(ast::CfgAtomKey::True) => Ok(true),
-            Some(ast::CfgAtomKey::False) => Ok(false),
-            Some(ast::CfgAtomKey::Ident(key)) => {
-                let key = key.text().to_string();
-                if let Some(token) = atom.string_token() {
-                    let value = ast::String::cast(token)
-                        .ok_or_else(|| {
-                            format!("{}: invalid cfg string value", file_path.display())
-                        })?
-                        .value()
-                        .map_err(|error| {
-                            format!(
-                                "{}: invalid cfg string value: {error:?}",
-                                file_path.display()
-                            )
-                        })?
-                        .into_owned();
-                    Ok(cfg.contains(&CfgAtom::KeyValue(key, value)))
-                } else {
-                    Ok(cfg.contains(&CfgAtom::Flag(key)))
-                }
-            }
+            Some(ast::CfgAtomKey::True) => Ok(CfgExpr::True),
+            Some(ast::CfgAtomKey::False) => Ok(CfgExpr::False),
+            Some(ast::CfgAtomKey::Ident(_)) => Ok(CfgExpr::Atom(atom.syntax().text().to_string())),
             None => Err(format!(
                 "{}: invalid cfg predicate {:?}",
                 file_path.display(),
@@ -150,27 +132,18 @@ pub(super) fn eval_cfg_predicate(
             let keyword = composite
                 .keyword()
                 .ok_or_else(|| format!("{}: cfg predicate has no operator", file_path.display()))?;
-            let predicates = composite.cfg_predicates().collect::<Vec<_>>();
+            let expressions = composite
+                .cfg_predicates()
+                .map(|predicate| cfg_predicate_expression(predicate, file_path))
+                .collect::<Result<Vec<_>, _>>()?;
             match keyword.text() {
-                "all" => {
-                    for predicate in predicates {
-                        if !eval_cfg_predicate(predicate, cfg, file_path)? {
-                            return Ok(false);
-                        }
-                    }
-                    Ok(true)
-                }
-                "any" => {
-                    for predicate in predicates {
-                        if eval_cfg_predicate(predicate, cfg, file_path)? {
-                            return Ok(true);
-                        }
-                    }
-                    Ok(false)
-                }
-                "not" if predicates.len() == 1 => {
-                    Ok(!eval_cfg_predicate(predicates[0].clone(), cfg, file_path)?)
-                }
+                "all" => Ok(CfgExpr::all(expressions)),
+                "any" => Ok(CfgExpr::any(expressions)),
+                "not" if expressions.len() == 1 => Ok(expressions
+                    .into_iter()
+                    .next()
+                    .expect("one cfg expression")
+                    .not()),
                 "not" => Err(format!(
                     "{}: cfg not(...) requires exactly one predicate",
                     file_path.display()
@@ -181,5 +154,68 @@ pub(super) fn eval_cfg_predicate(
                 )),
             }
         }
+    }
+}
+
+pub(super) fn syntax_is_active(node: &SyntaxNode, file_path: &Path) -> Result<bool, String> {
+    for ancestor in node.ancestors() {
+        let Some(owner) = ast::AnyHasAttrs::cast(ancestor) else {
+            continue;
+        };
+        for attr in owner.attrs() {
+            if let Some(meta) = attr.meta()
+                && owner_condition(meta, file_path)?.is_false()
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn owner_condition(meta: ast::Meta, file_path: &Path) -> Result<CfgExpr, String> {
+    match meta {
+        ast::Meta::CfgMeta(meta) => {
+            let predicate = meta.cfg_predicate().ok_or_else(|| {
+                format!("{}: cfg attribute has no predicate", file_path.display())
+            })?;
+            cfg_predicate_expression(predicate, file_path)
+        }
+        ast::Meta::CfgAttrMeta(meta) => {
+            let predicate = meta.cfg_predicate().ok_or_else(|| {
+                format!(
+                    "{}: cfg_attr attribute has no predicate",
+                    file_path.display()
+                )
+            })?;
+            let condition = cfg_predicate_expression(predicate, file_path)?;
+            let nested = CfgExpr::all(
+                meta.metas()
+                    .map(|meta| owner_condition(meta, file_path))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            Ok(CfgExpr::any([condition.not(), nested]))
+        }
+        _ => Ok(CfgExpr::True),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CfgExpr;
+
+    #[test]
+    fn simplifies_boolean_expressions() {
+        let atom = CfgExpr::Atom("unix".to_owned());
+        assert_eq!(CfgExpr::all([atom.clone(), atom.clone()]), atom.clone());
+        assert_eq!(
+            CfgExpr::all([atom.clone(), atom.clone().not()]),
+            CfgExpr::False
+        );
+        assert_eq!(
+            CfgExpr::any([atom.clone(), atom.clone().not()]),
+            CfgExpr::True
+        );
+        assert_eq!(atom.clone().not().not(), atom);
     }
 }

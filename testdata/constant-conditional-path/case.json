@@ -1,0 +1,11 @@
+{
+  "mustContain": [
+    "#[cfg_attr(any(), path = \"missing.rs\")]",
+    "#[cfg_attr(all(), path = \"chosen.rs\")]",
+    "pub const VALUE: &str = \"fallback\";",
+    "pub const VALUE: &str = \"chosen\";"
+  ],
+  "mustNotContain": ["mod fallback;", "mod selected;", "#[cfg(not("],
+  "mustIncludeFiles": ["fallback.rs", "chosen.rs"],
+  "mustExcludeFiles": ["missing.rs"]
+}

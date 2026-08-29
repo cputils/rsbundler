@@ -1,9 +1,13 @@
 {
-  "cfg": ["selected"],
-  "useDefaultCfg": false,
-  "rustcArgs": ["--cfg", "selected"],
-  "mustContain": ["pub const VALUE: &str = \"selected\";"],
-  "mustNotContain": ["pub const VALUE: &str = \"fallback\";"],
-  "mustIncludeFiles": ["selected.rs"],
-  "mustExcludeFiles": ["fallback.rs"]
+  "mustContain": [
+    "#[cfg(selected)]",
+    "#[cfg(not(selected))]",
+    "pub const VALUE: &str = \"selected\";",
+    "pub const VALUE: &str = \"fallback\";"
+  ],
+  "mustIncludeFiles": ["selected.rs", "fallback.rs"],
+  "runtimeChecks": [
+    {},
+    { "rustcArgs": ["--cfg", "selected"] }
+  ]
 }

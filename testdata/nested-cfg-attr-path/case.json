@@ -1,0 +1,16 @@
+{
+  "mustContain": [
+    "#[cfg(all(outer, feature = \"inner\"))]",
+    "#[cfg(not(all(outer, feature = \"inner\")))]",
+    "pub const VALUE: &str = \"nested\";",
+    "pub const VALUE: &str = \"default\";"
+  ],
+  "mustNotContain": ["mod selected;"],
+  "mustIncludeFiles": ["nested.rs", "selected.rs"],
+  "runtimeChecks": [
+    {},
+    { "rustcArgs": ["--cfg", "outer"] },
+    { "rustcArgs": ["--cfg", "feature=\"inner\""] },
+    { "rustcArgs": ["--cfg", "outer", "--cfg", "feature=\"inner\""] }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "mustContain": [
+    "pub const VALUE: &str = \"default-default\";",
+    "pub const VALUE: &str = \"default-alternate\";",
+    "pub const VALUE: &str = \"alternate-default\";",
+    "pub const VALUE: &str = \"alternate-alternate\";"
+  ],
+  "mustNotContain": ["pub mod leaf;"],
+  "mustContainCount": { "pub mod leaf {": 4 },
+  "mustIncludeFiles": ["leaf.rs"],
+  "runtimeChecks": [
+    {},
+    { "rustcArgs": ["--cfg", "outer_alt"] },
+    { "rustcArgs": ["--cfg", "inner_alt"] },
+    { "rustcArgs": ["--cfg", "outer_alt", "--cfg", "inner_alt"] }
+  ]
+}

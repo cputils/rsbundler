@@ -54,10 +54,6 @@ pub struct BundleOptions {
     /// Top-level modules to retain as out-of-line runtime/build-time dependencies.
     /// A `// bundle` directive on a declaration overrides this list.
     pub external: Vec<String>,
-    /// Additional active conditional-compilation options (`name` or `key=value`).
-    pub cfg: Vec<String>,
-    /// Whether to start with the target cfg values embedded when rsbundler was built.
-    pub use_default_cfg: bool,
     /// Compile-time environment values available to statically evaluated `env!` calls.
     pub environment: Vec<(String, String)>,
 }
@@ -69,8 +65,6 @@ impl Default for BundleOptions {
             max_source_files: DEFAULT_MAX_SOURCE_FILES,
             inline_includes: true,
             external: Vec::new(),
-            cfg: Vec::new(),
-            use_default_cfg: true,
             environment: Vec::new(),
         }
     }

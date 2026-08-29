@@ -1,0 +1,15 @@
+{
+  "mustContain": [
+    "#[cfg(alternate)]",
+    "#[cfg(not(alternate))]",
+    "pub const VALUE: &str = \"alternate\";",
+    "pub const VALUE: &str = \"default\";"
+  ],
+  "mustNotContain": ["pub mod child;"],
+  "mustIncludeFiles": ["child.rs"],
+  "mustContainCount": { "pub mod child {": 2 },
+  "runtimeChecks": [
+    {},
+    { "rustcArgs": ["--cfg", "alternate"] }
+  ]
+}

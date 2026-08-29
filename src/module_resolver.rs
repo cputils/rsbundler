@@ -6,7 +6,7 @@ use ra_ap_syntax::{
     ast::{HasAttrs, HasName, LiteralKind},
 };
 
-use super::cfg::{CfgAtom, eval_cfg_predicate};
+use super::cfg::{CfgExpr, cfg_predicate_expression};
 
 #[derive(Clone, Debug)]
 pub(super) struct SourceContext {
@@ -49,22 +49,23 @@ impl SourceContext {
 }
 
 #[derive(Debug)]
-pub(super) struct ModuleLocation {
-    default_dir: PathBuf,
-    path_attr_dir: PathBuf,
-}
-
-#[derive(Debug)]
 pub(super) struct ResolvedModuleFile {
     pub(super) path: PathBuf,
     pub(super) loaded_through_path_attr: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) enum ModuleResolutionError {
     Missing(String),
     Ambiguous(String),
     Invalid(String),
+}
+
+#[derive(Debug)]
+pub(super) struct ModuleFileVariant {
+    pub(super) condition: CfgExpr,
+    pub(super) resolution: Result<ResolvedModuleFile, ModuleResolutionError>,
+    pub(super) inline_default_dir: Option<PathBuf>,
 }
 
 impl ModuleResolutionError {
@@ -109,12 +110,11 @@ pub(super) fn module_path_is_external(path: &str, external: &HashSet<String>) ->
         .is_some_and(|name| external.contains(name.strip_prefix("r#").unwrap_or(name)))
 }
 
-pub(super) fn module_location(
+pub(super) fn module_file_variants(
     module: &ast::Module,
     context: &SourceContext,
     file_path: &Path,
-    cfg: &HashSet<CfgAtom>,
-) -> Result<ModuleLocation, String> {
+) -> Result<Vec<ModuleFileVariant>, String> {
     let mut ancestors = module
         .syntax()
         .ancestors()
@@ -124,93 +124,172 @@ pub(super) fn module_location(
         .collect::<Vec<_>>();
     ancestors.reverse();
 
-    let mut default_dir = context.default_module_dir.clone();
+    let mut locations = vec![LocationVariant {
+        condition: CfgExpr::True,
+        default_dir: Ok(context.default_module_dir.clone()),
+    }];
     for ancestor in &ancestors {
-        if let Some(path) = explicit_path_attr(ancestor, file_path, cfg)? {
-            default_dir.push(path);
-        } else {
-            default_dir.push(module_name(ancestor, file_path)?);
-        }
-    }
-
-    let path_attr_dir = if ancestors.is_empty() {
-        context.physical_dir.clone()
-    } else {
-        default_dir.clone()
-    };
-    Ok(ModuleLocation {
-        default_dir,
-        path_attr_dir,
-    })
-}
-
-pub(super) fn inline_module_default_dir(
-    module: &ast::Module,
-    location: &ModuleLocation,
-    file_path: &Path,
-    cfg: &HashSet<CfgAtom>,
-) -> Result<PathBuf, String> {
-    if let Some(path) = explicit_path_attr(module, file_path, cfg)? {
-        return Ok(location.path_attr_dir.join(path));
-    }
-    Ok(location.default_dir.join(module_name(module, file_path)?))
-}
-
-pub(super) fn module_attributes_allow_inlining(
-    module: &ast::Module,
-    cfg: &HashSet<CfgAtom>,
-    file_path: &Path,
-) -> Result<bool, String> {
-    for attr in module.attrs() {
-        let Some(meta) = attr.meta() else {
-            continue;
-        };
-        if !meta_allows_inlining(meta, cfg, file_path)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn meta_allows_inlining(
-    meta: ast::Meta,
-    cfg: &HashSet<CfgAtom>,
-    file_path: &Path,
-) -> Result<bool, String> {
-    if let ast::Meta::CfgAttrMeta(cfg_attr) = meta {
-        let predicate = cfg_attr.cfg_predicate().ok_or_else(|| {
-            format!(
-                "{}: cfg_attr attribute has no predicate",
-                file_path.display()
-            )
-        })?;
-        if !eval_cfg_predicate(predicate, cfg, file_path)? {
-            return Ok(true);
-        }
-        for nested in cfg_attr.metas() {
-            if !meta_allows_inlining(nested, cfg, file_path)? {
-                return Ok(false);
+        let choices = module_path_choices(ancestor, file_path)?;
+        let default_name = module_name(ancestor, file_path)?;
+        let mut next = Vec::new();
+        for location in locations {
+            let Ok(default_dir) = location.default_dir else {
+                next.push(location);
+                continue;
+            };
+            for choice in &choices {
+                let condition =
+                    CfgExpr::all([location.condition.clone(), choice.condition.clone()]);
+                if condition.is_false() {
+                    continue;
+                }
+                let default_dir = match &choice.selection {
+                    PathSelection::Default => Ok(default_dir.join(&default_name)),
+                    PathSelection::Path(path) => Ok(default_dir.join(path)),
+                    PathSelection::Invalid(message) => {
+                        Err(ModuleResolutionError::Invalid(message.clone()))
+                    }
+                };
+                next.push(LocationVariant {
+                    condition,
+                    default_dir,
+                });
             }
         }
-        return Ok(true);
+        locations = next;
     }
 
-    let path = match meta {
+    let choices = module_path_choices(module, file_path)?;
+    let name = module_name(module, file_path)?;
+    let mut variants = Vec::new();
+    for location in locations {
+        let default_dir = match location.default_dir {
+            Ok(default_dir) => default_dir,
+            Err(error) => {
+                variants.push(ModuleFileVariant {
+                    condition: location.condition,
+                    resolution: Err(error),
+                    inline_default_dir: None,
+                });
+                continue;
+            }
+        };
+        let path_attr_dir = if ancestors.is_empty() {
+            context.physical_dir.clone()
+        } else {
+            default_dir.clone()
+        };
+        for choice in &choices {
+            let condition = CfgExpr::all([location.condition.clone(), choice.condition.clone()]);
+            if condition.is_false() {
+                continue;
+            }
+            let (resolution, inline_default_dir) = match &choice.selection {
+                PathSelection::Default => {
+                    let inline_default_dir = default_dir.join(&name);
+                    (
+                        resolve_default_module(&default_dir, &name, file_path),
+                        Some(inline_default_dir),
+                    )
+                }
+                PathSelection::Path(path) => {
+                    let resolved = path_attr_dir.join(path);
+                    (
+                        Ok(ResolvedModuleFile {
+                            path: resolved.clone(),
+                            loaded_through_path_attr: true,
+                        }),
+                        Some(resolved),
+                    )
+                }
+                PathSelection::Invalid(message) => {
+                    (Err(ModuleResolutionError::Invalid(message.clone())), None)
+                }
+            };
+            variants.push(ModuleFileVariant {
+                condition,
+                resolution,
+                inline_default_dir,
+            });
+        }
+    }
+    Ok(variants)
+}
+
+pub(super) fn module_inlining_condition(
+    module: &ast::Module,
+    file_path: &Path,
+) -> Result<CfgExpr, String> {
+    let mut unsafe_conditions = Vec::new();
+    let modules = std::iter::once(module.clone()).chain(
+        module
+            .syntax()
+            .ancestors()
+            .skip(1)
+            .filter_map(ast::Module::cast)
+            .filter(|ancestor| ancestor.item_list().is_some()),
+    );
+    for module in modules {
+        for attr in module.attrs() {
+            let Some(meta) = attr.meta() else {
+                continue;
+            };
+            collect_unsafe_attribute_conditions(
+                meta,
+                CfgExpr::True,
+                &mut unsafe_conditions,
+                file_path,
+            )?;
+        }
+    }
+    Ok(CfgExpr::any(unsafe_conditions).not())
+}
+
+fn collect_unsafe_attribute_conditions(
+    meta: ast::Meta,
+    activation: CfgExpr,
+    conditions: &mut Vec<CfgExpr>,
+    file_path: &Path,
+) -> Result<(), String> {
+    if activation.is_false() {
+        return Ok(());
+    }
+    let path = match &meta {
+        ast::Meta::CfgAttrMeta(cfg_attr) => {
+            let predicate = cfg_attr.cfg_predicate().ok_or_else(|| {
+                format!(
+                    "{}: cfg_attr attribute has no predicate",
+                    file_path.display()
+                )
+            })?;
+            let activation =
+                CfgExpr::all([activation, cfg_predicate_expression(predicate, file_path)?]);
+            for nested in cfg_attr.metas() {
+                collect_unsafe_attribute_conditions(
+                    nested,
+                    activation.clone(),
+                    conditions,
+                    file_path,
+                )?;
+            }
+            return Ok(());
+        }
+        ast::Meta::CfgMeta(_) => return Ok(()),
+        ast::Meta::UnsafeMeta(meta) => {
+            let Some(meta) = meta.meta() else {
+                conditions.push(activation);
+                return Ok(());
+            };
+            return collect_unsafe_attribute_conditions(meta, activation, conditions, file_path);
+        }
         ast::Meta::PathMeta(meta) => meta.path(),
         ast::Meta::TokenTreeMeta(meta) => meta.path(),
         ast::Meta::KeyValueMeta(meta) => meta.path(),
-        ast::Meta::CfgMeta(_) => return Ok(true),
-        ast::Meta::CfgAttrMeta(_) => unreachable!(),
-        ast::Meta::UnsafeMeta(meta) => {
-            return meta
-                .meta()
-                .map_or(Ok(false), |meta| meta_allows_inlining(meta, cfg, file_path));
-        }
     }
     .map(|path| path.syntax().text().to_string())
     .unwrap_or_default();
     let name = path.trim_start_matches("::");
-    Ok(matches!(
+    if !matches!(
         name,
         "path"
             | "doc"
@@ -230,27 +309,19 @@ fn meta_allows_inlining(
             | "should_panic"
             | "rustfmt::skip"
             | "rust_analyzer::skip"
-    ))
+    ) {
+        conditions.push(activation);
+    }
+    Ok(())
 }
 
-pub(super) fn resolve_module_file(
-    module: &ast::Module,
-    location: &ModuleLocation,
+fn resolve_default_module(
+    default_dir: &Path,
+    name: &str,
     declaring_file: &Path,
-    cfg: &HashSet<CfgAtom>,
 ) -> Result<ResolvedModuleFile, ModuleResolutionError> {
-    if let Some(path) =
-        explicit_path_attr(module, declaring_file, cfg).map_err(ModuleResolutionError::Invalid)?
-    {
-        return Ok(ResolvedModuleFile {
-            path: location.path_attr_dir.join(path),
-            loaded_through_path_attr: true,
-        });
-    }
-
-    let name = module_name(module, declaring_file).map_err(ModuleResolutionError::Invalid)?;
-    let flat = location.default_dir.join(format!("{name}.rs"));
-    let directory = location.default_dir.join(&name).join("mod.rs");
+    let flat = default_dir.join(format!("{name}.rs"));
+    let directory = default_dir.join(name).join("mod.rs");
     match (flat.is_file(), directory.is_file()) {
         (true, false) => Ok(ResolvedModuleFile {
             path: flat,
@@ -330,10 +401,98 @@ fn module_name(module: &ast::Module, file_path: &Path) -> Result<String, String>
     Ok(name.strip_prefix("r#").unwrap_or(&name).to_owned())
 }
 
-fn collect_active_path_values(
+#[derive(Debug)]
+struct LocationVariant {
+    condition: CfgExpr,
+    default_dir: Result<PathBuf, ModuleResolutionError>,
+}
+
+#[derive(Clone, Debug)]
+struct PathCandidate {
+    condition: CfgExpr,
+    path: Result<PathBuf, String>,
+}
+
+#[derive(Clone, Debug)]
+struct PathChoice {
+    condition: CfgExpr,
+    selection: PathSelection,
+}
+
+#[derive(Clone, Debug)]
+enum PathSelection {
+    Default,
+    Path(PathBuf),
+    Invalid(String),
+}
+
+fn module_path_choices(module: &ast::Module, file_path: &Path) -> Result<Vec<PathChoice>, String> {
+    let mut candidates = Vec::new();
+    for attr in module.attrs() {
+        if let Some(meta) = attr.meta() {
+            collect_path_candidates(meta, CfgExpr::True, &mut candidates, file_path)?;
+        }
+    }
+    candidates.retain(|candidate| !candidate.condition.is_false());
+
+    let conditions = candidates
+        .iter()
+        .map(|candidate| candidate.condition.clone())
+        .collect::<Vec<_>>();
+    let mut choices = Vec::new();
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let other_conditions = conditions
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != index)
+            .map(|(_, condition)| condition.clone());
+        let condition = CfgExpr::all([candidate.condition, CfgExpr::any(other_conditions).not()]);
+        if condition.is_false() {
+            continue;
+        }
+        let selection = match candidate.path {
+            Ok(path) => PathSelection::Path(path),
+            Err(message) => PathSelection::Invalid(message),
+        };
+        choices.push(PathChoice {
+            condition,
+            selection,
+        });
+    }
+
+    let any_path = CfgExpr::any(conditions.iter().cloned());
+    let default_condition = any_path.clone().not();
+    if !default_condition.is_false() {
+        choices.push(PathChoice {
+            condition: default_condition,
+            selection: PathSelection::Default,
+        });
+    }
+
+    let conflicts = conditions.iter().enumerate().flat_map(|(index, left)| {
+        conditions[index + 1..]
+            .iter()
+            .map(move |right| CfgExpr::all([left.clone(), right.clone()]))
+    });
+    let conflict_condition = CfgExpr::any(conflicts);
+    if !conflict_condition.is_false() {
+        choices.push(PathChoice {
+            condition: conflict_condition,
+            selection: PathSelection::Invalid(format!(
+                "{}: module {:?} has more than one active path attribute",
+                file_path.display(),
+                module_name(module, file_path)?
+            )),
+        });
+    }
+
+    Ok(choices)
+}
+
+fn collect_path_candidates(
     meta: ast::Meta,
-    cfg: &HashSet<CfgAtom>,
-    values: &mut Vec<String>,
+    activation: CfgExpr,
+    candidates: &mut Vec<PathCandidate>,
     file_path: &Path,
 ) -> Result<(), String> {
     match meta {
@@ -343,29 +502,28 @@ fn collect_active_path_values(
                 .and_then(|path| path.as_single_name_ref())
                 .is_some_and(|name| name.text() == "path") =>
         {
-            let value = match meta.expr() {
+            let path = match meta.expr() {
                 Some(ast::Expr::Literal(literal)) => match literal.kind() {
                     LiteralKind::String(value) => value
                         .value()
                         .map_err(|error| {
                             format!("invalid path string in {}: {error:?}", file_path.display())
-                        })?
-                        .into_owned(),
-                    _ => {
-                        return Err(format!(
-                            "{}: path attribute must be a string literal",
-                            file_path.display()
-                        ));
-                    }
-                },
-                _ => {
-                    return Err(format!(
+                        })
+                        .map(|value| PathBuf::from(value.into_owned())),
+                    _ => Err(format!(
                         "{}: path attribute must be a string literal",
                         file_path.display()
-                    ));
-                }
+                    )),
+                },
+                _ => Err(format!(
+                    "{}: path attribute must be a string literal",
+                    file_path.display()
+                )),
             };
-            values.push(value);
+            candidates.push(PathCandidate {
+                condition: activation,
+                path,
+            });
             Ok(())
         }
         ast::Meta::CfgAttrMeta(meta) => {
@@ -375,35 +533,13 @@ fn collect_active_path_values(
                     file_path.display()
                 )
             })?;
-            if eval_cfg_predicate(predicate, cfg, file_path)? {
-                for nested in meta.metas() {
-                    collect_active_path_values(nested, cfg, values, file_path)?;
-                }
+            let activation =
+                CfgExpr::all([activation, cfg_predicate_expression(predicate, file_path)?]);
+            for nested in meta.metas() {
+                collect_path_candidates(nested, activation.clone(), candidates, file_path)?;
             }
             Ok(())
         }
         _ => Ok(()),
-    }
-}
-
-fn explicit_path_attr(
-    module: &ast::Module,
-    file_path: &Path,
-    cfg: &HashSet<CfgAtom>,
-) -> Result<Option<PathBuf>, String> {
-    let mut values = Vec::new();
-    for attr in module.attrs() {
-        if let Some(meta) = attr.meta() {
-            collect_active_path_values(meta, cfg, &mut values, file_path)?;
-        }
-    }
-    match values.len() {
-        0 => Ok(None),
-        1 => Ok(values.pop().map(PathBuf::from)),
-        _ => Err(format!(
-            "{}: module {:?} has more than one active path attribute",
-            file_path.display(),
-            module_name(module, file_path)?
-        )),
     }
 }

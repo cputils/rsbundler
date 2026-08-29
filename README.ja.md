@@ -48,7 +48,7 @@ rsbundler src/main.rs > bundled.rs
 - `std::include_str!` のような修飾済み標準マクロと、`use std::include_str as embedded` のような明示的alias
 - 明示的な標準aliasを含む直接の `file!`、`line!`、`column!`（ソースを移動する前に元の値へ置換）
 - `macro_rules!` transcriber 内の、静的にparseできるmodule / include依存
-- ターゲットを考慮した `cfg`、`all`、`any`、`not`、ネストした `cfg_attr` の評価
+- `cfg`、`all`、`any`、`not`、ネストした `cfg_attr` 分岐のターゲット非依存な展開
 - UTF-8 BOM とソースファイルの shebang
 - rollback可能な循環参照検出と、依存ソースファイル数の上限
 
@@ -73,9 +73,9 @@ const SCHEMA: &str = include_str!(SCHEMA_PATH); // no-bundle
 
 ### 条件付きコンパイル
 
-rsbundler は条件属性を評価してから依存を解決します。デフォルトでは、rsbundler 実行ファイルのコンパイル対象になったターゲットの cfg 値を実行ファイル内へ埋め込み、実行時にコンパイラを起動せず利用します。アプリ固有の値は `--cfg name` または `--cfg 'key="value"'` を繰り返して追加できます。クロスターゲット用には `--no-default-cfg` と完全な cfg 一式を指定してください。
+rsbundler はコンパイル対象を選択せず、自身をコンパイルした際の cfg 値も使用しません。元の条件属性を残したまま、静的に解決できるすべての依存分岐を展開します。`any()` のように常に偽となる述語は、依存ファイルを読まずに除外します。
 
-無効な依存は変更せず、ファイルも読みません。有効な `cfg_attr(..., path = "...")` は通常のRust module解決に使います。属性自体は生成ソースへ残りますが、inline化された本体はバンドル時に選んだ cfg 専用です。生成物も同じ cfg 一式でコンパイルしてください。
+`cfg_attr(..., path = "...")` が1つのmoduleに対して異なるファイルを選択し得る場合、選択される各pathとデフォルトmodule pathを、互いに排他的な `#[cfg(...)]` 付きinline module分岐として出力します。これにより、Rustコンパイラが任意のcfg一式で利用できる単一のbundleになります。欠落・曖昧・循環・生成予定などの理由で安全に展開できない候補は、その条件下だけ元の外部ファイルmodule宣言として残し、ほかの候補は展開します。複数のpath属性が同時に有効になり得る重複条件も変更せず残し、診断や優先順位はrustc自身に委ねます。ネストした `cfg_attr`、条件付き属性マクロ、pathによって探索基準が変わるinline ancestor、候補ごとに異なる子moduleの基準も同様に扱います。
 
 ## 精度上の境界
 
@@ -102,8 +102,6 @@ pybundler のinterpreter / sys.path境界オプションは、すべてのRust�
 | `--edition <EDITION>`        | Rust `2015`、`2018`、`2021`、`2024` のいずれかとして解析する | `2024`      |
 | `--max-source-files <COUNT>` | entry を除く、展開する module / include ファイル数を制限する | `2048`      |
 | `-e, --external <MODULE>`    | トップレベルmoduleを保持する（複数指定可）                   | なし        |
-| `--cfg <SPEC>`               | 有効なcfgへ `name` / `key=value` を追加する（複数指定可）    | なし        |
-| `--no-default-cfg`           | rsbundlerのビルドターゲット用cfgを使わない                   | 無効        |
 | `--env <KEY=VALUE>`          | 静的includeパス内の `env!` 値を設定する                      | process環境 |
 | `--no-inline-includes`       | 3 種類の組み込み include マクロを生成コードへ残す            | 無効        |
 
@@ -130,7 +128,7 @@ std::fs::write("bundled.rs", result.code)?;
 
 `BundleResult` には、正規化された entry の絶対パスと、バンドルに使ったすべての module / include ファイルの決定的なメタデータも含まれます。
 
-`BundleOptions` にはedition、ファイル数上限、include制御に加え、対応する `external`、`cfg`、`use_default_cfg`、`environment` フィールドがあります。optionsで指定した環境値はrsbundler processの環境変数より優先されます。
+`BundleOptions` にはedition、ファイル数上限、include制御に加え、対応する `external`、`environment` フィールドがあります。optionsで指定した環境値はrsbundler processの環境変数より優先されます。
 
 ## ライセンス
 

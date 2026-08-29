@@ -1,0 +1,22 @@
+{
+  "mustContain": [
+    "#[cfg(all(choice_a, not(choice_b)))]",
+    "#[cfg(all(choice_b, not(choice_a)))]",
+    "#[cfg(not(any(choice_a, choice_b)))]",
+    "#[cfg(all(choice_a, choice_b))]",
+    "pub const VALUE: &str = \"a\";",
+    "pub const VALUE: &str = \"b\";",
+    "pub const VALUE: &str = \"default\";"
+  ],
+  "mustContainCount": {
+    "mod selected {": 3,
+    "mod selected;": 1
+  },
+  "mustIncludeFiles": ["a.rs", "b.rs", "selected.rs"],
+  "runtimeChecks": [
+    {},
+    { "rustcArgs": ["--cfg", "choice_a"] },
+    { "rustcArgs": ["--cfg", "choice_b"] },
+    { "rustcArgs": ["--cfg", "choice_a", "--cfg", "choice_b"] }
+  ]
+}

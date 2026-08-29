@@ -1,9 +1,12 @@
 {
-  "cfg": ["unix"],
-  "useDefaultCfg": false,
-  "rustcArgs": ["--cfg", "unix", "-Aexplicit_builtin_cfgs_in_flags"],
-  "mustContain": ["pub fn unix() {}"],
-  "mustNotContain": ["pub fn fallback() {}"],
-  "mustIncludeFiles": ["unix.rs"],
-  "mustExcludeFiles": ["platform.rs"]
+  "mustContain": [
+    "#[cfg(unix)]",
+    "#[cfg(not(unix))]",
+    "pub fn unix() {}",
+    "pub fn fallback() {}"
+  ],
+  "mustIncludeFiles": ["unix.rs", "platform.rs"],
+  "runtimeChecks": [
+    { "rustcArgs": ["--cfg", "unix", "-Aexplicit_builtin_cfgs_in_flags"] }
+  ]
 }

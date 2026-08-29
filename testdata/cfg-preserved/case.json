@@ -1,0 +1,14 @@
+{
+  "mustContain": [
+    "#[cfg(feature = \"alpha\")]\nmod alpha {",
+    "#[cfg(not(feature = \"alpha\"))]\nmod fallback {",
+    "\"alpha data\\n\"",
+    "\"fallback data\\n\""
+  ],
+  "mustNotContain": ["mod alpha;", "mod fallback;", "include_str!("],
+  "mustIncludeFiles": ["alpha.rs", "fallback.rs", "alpha.txt", "fallback.txt"],
+  "runtimeChecks": [
+    {},
+    { "rustcArgs": ["--cfg", "feature=\"alpha\""] }
+  ]
+}

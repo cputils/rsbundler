@@ -4,18 +4,18 @@ use std::path::{Path, PathBuf};
 
 use ra_ap_syntax::{AstNode, SourceFile, SyntaxNode, ast};
 
-use super::cfg::{CfgAtom, parse_cfg_spec, syntax_is_active};
+use super::cfg::{CfgExpr, syntax_is_active};
 use super::directive::{BundleDirective, bundle_directive};
-use super::edit::{Edit, apply_edits, byte_range, overlaps_any};
+use super::edit::{ByteRange, Edit, apply_edits, byte_range, overlaps_any};
 use super::include::{
     IncludeKind, LocationMacroKind, MacroScope, byte_string_expression, include_macro_kind,
     location_macro_kind, resolve_location_macro_path, static_include_argument,
 };
 use super::macro_rules::{hidden_location_macros, relevant_transcribers};
 use super::module_resolver::{
-    SourceContext, containing_module_path, inline_module_default_dir,
-    module_attributes_allow_inlining, module_location, module_path_is_external,
-    normalize_external_name, qualified_module_path, resolve_module_file,
+    ModuleFileVariant, SourceContext, containing_module_path, module_file_variants,
+    module_inlining_condition, module_path_is_external, normalize_external_name,
+    qualified_module_path,
 };
 use super::source::{
     canonical_file, display_path, format_parse_errors, read_rust_source, resolve_entry_file,
@@ -64,7 +64,6 @@ pub(super) fn bundle_file(
 #[derive(Debug)]
 struct Bundler {
     options: BundleOptions,
-    cfg: HashSet<CfgAtom>,
     environment: HashMap<String, String>,
     external: HashSet<String>,
     sources: Vec<BundledSource>,
@@ -172,18 +171,6 @@ impl RetentionSafety {
 
 impl Bundler {
     fn new(options: BundleOptions, bundle_dir: PathBuf) -> Result<Self, String> {
-        let mut cfg = HashSet::new();
-        if options.use_default_cfg {
-            for spec in env!("RSBUNDLER_DEFAULT_CFG")
-                .split('|')
-                .filter(|item| !item.is_empty())
-            {
-                cfg.insert(parse_cfg_spec(spec)?);
-            }
-        }
-        for spec in &options.cfg {
-            cfg.insert(parse_cfg_spec(spec)?);
-        }
         let environment = options.environment.iter().cloned().collect();
         let external = options
             .external
@@ -192,7 +179,6 @@ impl Bundler {
             .collect::<Result<HashSet<_>, _>>()?;
         Ok(Self {
             options,
-            cfg,
             environment,
             external,
             sources: Vec::new(),
@@ -268,9 +254,7 @@ impl Bundler {
             else {
                 continue;
             };
-            if !syntax_is_active(call.syntax(), &self.cfg, file_path)
-                .map_err(ExpansionError::fatal)?
-            {
+            if !syntax_is_active(call.syntax(), file_path).map_err(ExpansionError::fatal)? {
                 continue;
             }
             let directive = bundle_directive(call.syntax(), root, source, file_path)
@@ -303,6 +287,7 @@ impl Bundler {
             )));
         }
         let mut edits = Vec::new();
+        let mut pending_module_edits = Vec::new();
         let mut occupied_ranges = HashSet::new();
 
         for transcriber in transcribers {
@@ -358,15 +343,39 @@ impl Bundler {
                 }
                 continue;
             }
-            if !syntax_is_active(module.syntax(), &self.cfg, file_path)
-                .map_err(ExpansionError::fatal)?
-            {
+            if !syntax_is_active(module.syntax(), file_path).map_err(ExpansionError::fatal)? {
                 continue;
             }
-            if directive != BundleDirective::Bundle
-                && !module_attributes_allow_inlining(&module, &self.cfg, file_path)
-                    .map_err(ExpansionError::fatal)?
+            let module_range = byte_range(module.syntax().text_range());
+            if !occupied_ranges.insert((module_range.start, module_range.end)) {
+                continue;
+            }
+
+            let child_module_path = qualified_module_path(&module, module_path, file_path)
+                .map_err(ExpansionError::recoverable)?;
+            if !external_admitted
+                && directive != BundleDirective::Bundle
+                && module_path_is_external(&child_module_path, &self.external)
             {
+                if !retained_module_paths_are_stable {
+                    return Err(ExpansionError::preserve(format!(
+                        "external nested module retained in {}",
+                        file_path.display()
+                    )));
+                }
+                continue;
+            }
+
+            let inline_condition = if directive == BundleDirective::Bundle {
+                CfgExpr::True
+            } else {
+                match module_inlining_condition(&module, file_path) {
+                    Ok(condition) => condition,
+                    Err(_) if retained_module_paths_are_stable => continue,
+                    Err(error) => return Err(ExpansionError::preserve(error)),
+                }
+            };
+            if inline_condition.is_false() {
                 if !retained_module_paths_are_stable {
                     return Err(ExpansionError::preserve(format!(
                         "nested module with an expansion-sensitive attribute retained in {}",
@@ -375,100 +384,107 @@ impl Bundler {
                 }
                 continue;
             }
-            let range = byte_range(semicolon.text_range());
-            if !occupied_ranges.insert((range.start, range.end)) {
-                continue;
+
+            let variants = match module_file_variants(&module, context, file_path) {
+                Ok(variants) => variants,
+                Err(error) if directive != BundleDirective::Bundle => {
+                    if !retained_module_paths_are_stable {
+                        return Err(ExpansionError::preserve(error));
+                    }
+                    continue;
+                }
+                Err(error) => return Err(ExpansionError::fatal(error)),
+            };
+            let mut branches = Vec::new();
+            for variant in variants {
+                let variant_condition = variant.condition.clone();
+                let expansion_condition =
+                    CfgExpr::all([variant_condition.clone(), inline_condition.clone()]);
+                if directive != BundleDirective::Bundle {
+                    let retention_condition =
+                        CfgExpr::all([variant_condition, inline_condition.clone().not()]);
+                    if !retention_condition.is_false() {
+                        if !retained_module_paths_are_stable {
+                            return Err(ExpansionError::preserve(format!(
+                                "conditional expansion-sensitive module retained in {}",
+                                file_path.display()
+                            )));
+                        }
+                        branches.push(ModuleBranch::Retained(retention_condition));
+                    }
+                }
+                if expansion_condition.is_false() {
+                    continue;
+                }
+
+                let checkpoint = self.checkpoint();
+                let expansion = self.expand_module_variant(
+                    variant,
+                    &module,
+                    root,
+                    file_path,
+                    &child_module_path,
+                    macro_scope,
+                    external_admitted,
+                    directive,
+                );
+                match expansion {
+                    Ok(bundled) => branches.push(ModuleBranch::Inlined {
+                        condition: expansion_condition,
+                        source: bundled,
+                    }),
+                    Err(error) if error.is_preserve() => {
+                        self.rollback(checkpoint);
+                        if !retained_module_paths_are_stable {
+                            return Err(error);
+                        }
+                        branches.push(ModuleBranch::Retained(expansion_condition));
+                    }
+                    Err(error)
+                        if directive != BundleDirective::Bundle && error.is_recoverable() =>
+                    {
+                        self.rollback(checkpoint);
+                        if error.is_atomic() && !source_positions_are_stable {
+                            return Err(error);
+                        }
+                        if external_admitted {
+                            return Err(error);
+                        }
+                        if !retained_module_paths_are_stable {
+                            return Err(error.preserved());
+                        }
+                        branches.push(ModuleBranch::Retained(expansion_condition));
+                    }
+                    Err(error) if directive == BundleDirective::Bundle => {
+                        return Err(error.required());
+                    }
+                    Err(error) => return Err(error),
+                }
             }
 
-            let checkpoint = self.checkpoint();
-            let expansion: ExpansionResult<Option<Edit>> = (|| {
-                let location = module_location(&module, context, file_path, &self.cfg)
-                    .map_err(ExpansionError::recoverable)?;
-                let child_module_path = qualified_module_path(&module, module_path, file_path)
-                    .map_err(ExpansionError::recoverable)?;
-                if !external_admitted
-                    && directive != BundleDirective::Bundle
-                    && module_path_is_external(&child_module_path, &self.external)
-                {
-                    if !retained_module_paths_are_stable {
-                        return Err(ExpansionError::preserve(format!(
-                            "external nested module retained in {}",
-                            file_path.display()
-                        )));
-                    }
-                    return Ok(None);
-                }
-                let resolved = resolve_module_file(&module, &location, file_path, &self.cfg)
-                    .map_err(|error| ExpansionError::recoverable(error.into_message()))?;
-                let canonical = canonical_file(&resolved.path, "module file")
-                    .map_err(ExpansionError::recoverable)?;
-                self.check_module_cycle(&canonical, &child_module_path)?;
-                self.track_source(&canonical, &child_module_path, BundledSourceKind::Module)?;
-
-                let child_source =
-                    read_rust_source(&canonical, false).map_err(ExpansionError::recoverable)?;
-                let child_context = SourceContext::for_module_file(
-                    &resolved.path,
-                    resolved.loaded_through_path_attr,
-                )
-                .map_err(ExpansionError::recoverable)?;
-                let child_macro_scope = MacroScope::at(module.syntax(), root, macro_scope);
-                let child_module_paths_are_stable =
-                    inline_module_default_dir(&module, &location, file_path, &self.cfg)
-                        .map_err(ExpansionError::recoverable)?
-                        == child_context.default_module_dir;
-                let child_include_paths_are_stable = child_context.physical_dir == self.bundle_dir;
-                self.active_modules.push(canonical.clone());
-                let bundled = self.bundle_rust_source(
-                    &canonical,
-                    &child_source,
-                    &SourceSite {
-                        logical_file_path: &resolved.path,
-                        context: &child_context,
-                        module_path: &child_module_path,
-                        external_admitted: external_admitted
-                            || directive == BundleDirective::Bundle,
-                        macro_scope: &child_macro_scope,
-                        retention: RetentionSafety {
-                            module_paths: child_module_paths_are_stable,
-                            include_paths: child_include_paths_are_stable,
-                            source_positions: false,
-                        },
+            branches.retain(|branch| !branch.condition().is_false());
+            match branches.as_slice() {
+                [] => {}
+                [ModuleBranch::Retained(condition)] if condition.is_true() => {}
+                [
+                    ModuleBranch::Inlined {
+                        condition,
+                        source: child_source,
                     },
-                );
-                self.active_modules.pop();
-                let bundled = bundled?;
-                Ok(Some(Edit {
-                    start: range.start,
-                    end: range.end,
-                    replacement: module_replacement(source, range.start, &bundled),
-                }))
-            })();
-            match expansion {
-                Ok(Some(edit)) => edits.push(edit),
-                Ok(None) => {}
-                Err(error) if error.is_preserve() => {
-                    self.rollback(checkpoint);
-                    if !retained_module_paths_are_stable {
-                        return Err(error);
-                    }
-                }
-                Err(error) if directive != BundleDirective::Bundle && error.is_recoverable() => {
-                    self.rollback(checkpoint);
-                    if error.is_atomic() && !source_positions_are_stable {
-                        return Err(error);
-                    }
-                    if external_admitted {
-                        return Err(error);
-                    }
-                    if !retained_module_paths_are_stable {
-                        return Err(error.preserved());
-                    }
-                }
-                Err(error) if directive == BundleDirective::Bundle => {
-                    return Err(error.required());
-                }
-                Err(error) => return Err(error),
+                ] if condition.is_true() => edits.push(Edit {
+                    start: byte_range(semicolon.text_range()).start,
+                    end: byte_range(semicolon.text_range()).end,
+                    replacement: module_replacement(
+                        source,
+                        byte_range(semicolon.text_range()).start,
+                        child_source,
+                    ),
+                }),
+                _ => pending_module_edits.push(PendingModuleEdit {
+                    module_range,
+                    semicolon_range: byte_range(semicolon.text_range()),
+                    branches,
+                }),
             }
         }
 
@@ -486,9 +502,7 @@ impl Bundler {
             {
                 continue;
             }
-            if !syntax_is_active(call.syntax(), &self.cfg, file_path)
-                .map_err(ExpansionError::fatal)?
-            {
+            if !syntax_is_active(call.syntax(), file_path).map_err(ExpansionError::fatal)? {
                 continue;
             }
             let range = byte_range(call.syntax().text_range());
@@ -535,9 +549,7 @@ impl Bundler {
                     }
                     continue;
                 }
-                if !syntax_is_active(call.syntax(), &self.cfg, file_path)
-                    .map_err(ExpansionError::fatal)?
-                {
+                if !syntax_is_active(call.syntax(), file_path).map_err(ExpansionError::fatal)? {
                     continue;
                 }
                 let range = byte_range(call.syntax().text_range());
@@ -613,7 +625,80 @@ impl Bundler {
             }
         }
 
+        for pending in pending_module_edits {
+            let mut internal_edits = Vec::new();
+            let mut remaining_edits = Vec::new();
+            for edit in edits {
+                if edit.start >= pending.module_range.start && edit.end <= pending.module_range.end
+                {
+                    internal_edits.push(edit);
+                } else {
+                    remaining_edits.push(edit);
+                }
+            }
+            remaining_edits.push(
+                module_branches_edit(source, file_path, pending, internal_edits)
+                    .map_err(ExpansionError::fatal)?,
+            );
+            edits = remaining_edits;
+        }
+
         apply_edits(source, edits, file_path).map_err(ExpansionError::fatal)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expand_module_variant(
+        &mut self,
+        variant: ModuleFileVariant,
+        module: &ast::Module,
+        root: &SyntaxNode,
+        file_path: &Path,
+        child_module_path: &str,
+        macro_scope: &MacroScope,
+        external_admitted: bool,
+        directive: BundleDirective,
+    ) -> ExpansionResult<String> {
+        let resolved = variant
+            .resolution
+            .map_err(|error| ExpansionError::recoverable(error.into_message()))?;
+        let inline_default_dir = variant.inline_default_dir.ok_or_else(|| {
+            ExpansionError::recoverable(format!(
+                "failed to determine inline module directory for {child_module_path} in {}",
+                file_path.display()
+            ))
+        })?;
+        let canonical =
+            canonical_file(&resolved.path, "module file").map_err(ExpansionError::recoverable)?;
+        self.check_module_cycle(&canonical, child_module_path)?;
+        self.track_source(&canonical, child_module_path, BundledSourceKind::Module)?;
+
+        let child_source =
+            read_rust_source(&canonical, false).map_err(ExpansionError::recoverable)?;
+        let child_context =
+            SourceContext::for_module_file(&resolved.path, resolved.loaded_through_path_attr)
+                .map_err(ExpansionError::recoverable)?;
+        let child_macro_scope = MacroScope::at(module.syntax(), root, macro_scope);
+        let child_module_paths_are_stable = inline_default_dir == child_context.default_module_dir;
+        let child_include_paths_are_stable = child_context.physical_dir == self.bundle_dir;
+        self.active_modules.push(canonical.clone());
+        let bundled = self.bundle_rust_source(
+            &canonical,
+            &child_source,
+            &SourceSite {
+                logical_file_path: &resolved.path,
+                context: &child_context,
+                module_path: child_module_path,
+                external_admitted: external_admitted || directive == BundleDirective::Bundle,
+                macro_scope: &child_macro_scope,
+                retention: RetentionSafety {
+                    module_paths: child_module_paths_are_stable,
+                    include_paths: child_include_paths_are_stable,
+                    source_positions: false,
+                },
+            },
+        );
+        self.active_modules.pop();
+        bundled
     }
 
     fn expand_include(
@@ -789,6 +874,91 @@ struct IncludeSite<'a> {
     module_path: &'a str,
     external_admitted: bool,
     macro_scope: &'a MacroScope,
+}
+
+enum ModuleBranch {
+    Inlined { condition: CfgExpr, source: String },
+    Retained(CfgExpr),
+}
+
+impl ModuleBranch {
+    fn condition(&self) -> &CfgExpr {
+        match self {
+            Self::Inlined { condition, .. } | Self::Retained(condition) => condition,
+        }
+    }
+}
+
+struct PendingModuleEdit {
+    module_range: ByteRange,
+    semicolon_range: ByteRange,
+    branches: Vec<ModuleBranch>,
+}
+
+fn module_branches_edit(
+    source: &str,
+    file_path: &Path,
+    pending: PendingModuleEdit,
+    internal_edits: Vec<Edit>,
+) -> Result<Edit, String> {
+    let original = &source[pending.module_range.start..pending.module_range.end];
+    let indentation = line_indentation(source, pending.module_range.start);
+    let separator = format!("\n\n{indentation}");
+    let replacement = pending
+        .branches
+        .into_iter()
+        .map(|branch| {
+            let condition = branch.condition().clone();
+            let mut branch_edits = internal_edits
+                .iter()
+                .map(|edit| Edit {
+                    start: edit.start - pending.module_range.start,
+                    end: edit.end - pending.module_range.start,
+                    replacement: edit.replacement.clone(),
+                })
+                .collect::<Vec<_>>();
+            if let ModuleBranch::Inlined {
+                source: child_source,
+                ..
+            } = branch
+            {
+                branch_edits.push(Edit {
+                    start: pending.semicolon_range.start - pending.module_range.start,
+                    end: pending.semicolon_range.end - pending.module_range.start,
+                    replacement: module_replacement(
+                        source,
+                        pending.semicolon_range.start,
+                        &child_source,
+                    ),
+                });
+            }
+            let module_source = apply_edits(original, branch_edits, file_path)?;
+            if condition.is_true() {
+                Ok(module_source)
+            } else {
+                Ok(format!(
+                    "#[cfg({})]\n{indentation}{module_source}",
+                    condition.render()
+                ))
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .join(&separator);
+    Ok(Edit {
+        start: pending.module_range.start,
+        end: pending.module_range.end,
+        replacement,
+    })
+}
+
+fn line_indentation(source: &str, offset: usize) -> &str {
+    let line_start = source[..offset].rfind('\n').map_or(0, |index| index + 1);
+    let prefix = &source[line_start..offset];
+    if prefix.chars().all(char::is_whitespace) {
+        prefix
+    } else {
+        ""
+    }
 }
 
 fn module_replacement(source: &str, semicolon_offset: usize, child_source: &str) -> String {

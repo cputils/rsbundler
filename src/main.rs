@@ -28,14 +28,6 @@ struct Cli {
     #[arg(short, long)]
     external: Vec<String>,
 
-    /// Add an active cfg option (`name` or `key=value`); repeatable.
-    #[arg(long)]
-    cfg: Vec<String>,
-
-    /// Do not use the target cfg values embedded when rsbundler was built.
-    #[arg(long)]
-    no_default_cfg: bool,
-
     /// Set a compile-time environment value used by env! in include paths.
     #[arg(long, value_name = "KEY=VALUE")]
     env: Vec<String>,
@@ -99,8 +91,6 @@ fn run(cli: Cli) -> Result<(), String> {
             max_source_files: cli.max_source_files,
             inline_includes: !cli.no_inline_includes,
             external: cli.external,
-            cfg: cli.cfg,
-            use_default_cfg: !cli.no_default_cfg,
             environment,
         },
     )?;

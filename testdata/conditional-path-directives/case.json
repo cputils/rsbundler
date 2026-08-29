@@ -1,0 +1,16 @@
+{
+  "mustContain": [
+    "mod kept; // no-bundle",
+    "#[cfg(special)]",
+    "#[cfg(not(special))]",
+    "pub const VALUE: &str = \"forced-special\";",
+    "pub const VALUE: &str = \"forced-default\";"
+  ],
+  "mustNotContain": ["mod forced;"],
+  "mustIncludeFiles": ["forced.rs", "forced-special.rs"],
+  "mustExcludeFiles": ["kept.rs", "kept-special.rs"],
+  "runtimeChecks": [
+    {},
+    { "rustcArgs": ["--cfg", "special"] }
+  ]
+}

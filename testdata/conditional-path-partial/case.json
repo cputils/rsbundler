@@ -1,0 +1,15 @@
+{
+  "mustContain": [
+    "#[cfg(generated)]",
+    "#[cfg(not(generated))]",
+    "mod selected;",
+    "pub const VALUE: &str = \"default\";"
+  ],
+  "mustContainCount": { "mod selected;": 1, "mod selected {": 1 },
+  "mustIncludeFiles": ["selected.rs"],
+  "mustExcludeFiles": ["generated.rs"],
+  "runtimeChecks": [
+    {},
+    { "rustcArgs": ["--cfg", "generated"], "shouldCompile": false }
+  ]
+}

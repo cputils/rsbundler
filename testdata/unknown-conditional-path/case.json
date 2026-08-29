@@ -1,0 +1,21 @@
+{
+  "mustContain": [
+    "#[cfg(custom_platform)]",
+    "#[cfg(not(custom_platform))]",
+    "/// Platform selected by cfg.",
+    "Conditional platform module.\\n",
+    "pub const VALUE: &str = \"linux\";",
+    "pub const VALUE: &str = \"other\";"
+  ],
+  "mustNotContain": ["pub(crate) mod platform;", "include_str!("],
+  "mustContainCount": {
+    "/// Platform selected by cfg.": 2,
+    "pub(crate) mod platform {": 2,
+    "Conditional platform module.\\n": 2
+  },
+  "mustIncludeFiles": ["linux.rs", "platform.rs", "platform.md"],
+  "runtimeChecks": [
+    {},
+    { "rustcArgs": ["--cfg", "custom_platform"] }
+  ]
+}
