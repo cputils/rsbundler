@@ -1,5 +1,5 @@
 [tools]
-rust = { version = "1.95.0", components = "rust-analyzer,clippy,rustfmt" }
+rust = { version = "1.97.1", components = "rust-analyzer,clippy,rustfmt" }
 lefthook = "2.1.10"
 zizmor = "1.27.0"
 dprint = "0.55.2"
