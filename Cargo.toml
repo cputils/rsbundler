@@ -1,0 +1,18 @@
+[package]
+name = "rsbundler"
+version = "0.1.0"
+categories = ["command-line-utilities", "development-tools"]
+edition = "2024"
+keywords = ["rust", "bundler", "competitive-programming", "cli"]
+license = "MIT"
+repository = "https://github.com/cputils/rsbundler"
+rust-version = "1.95"
+description = "Bundle a Rust crate's local source dependencies into a single source file"
+
+[dependencies]
+clap = { version = "4.5.47", features = ["derive"] }
+ra_ap_syntax = "0.0.349"
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

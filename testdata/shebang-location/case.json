@@ -1,0 +1,5 @@
+{
+  "mustContain": ["pub const LINE: u32 = 2;"],
+  "mustNotContain": ["#!/usr/bin/env rust-script", "line!()"],
+  "mustIncludeFiles": ["child.rs"]
+}

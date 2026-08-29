@@ -1,0 +1,7 @@
+{
+  "mustContain": ["include!(\"generated/items.rs\")"],
+  "mustExcludeFiles": ["items.rs", "child.rs"],
+  "expectedSources": [
+    { "modulePath": "crate", "kind": "entry", "file": "main.rs" }
+  ]
+}

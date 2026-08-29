@@ -1,0 +1,9 @@
+{
+  "cfg": ["unix"],
+  "useDefaultCfg": false,
+  "rustcArgs": ["--cfg", "unix", "-Aexplicit_builtin_cfgs_in_flags"],
+  "mustContain": ["pub fn unix() {}"],
+  "mustNotContain": ["pub fn fallback() {}"],
+  "mustIncludeFiles": ["unix.rs"],
+  "mustExcludeFiles": ["platform.rs"]
+}

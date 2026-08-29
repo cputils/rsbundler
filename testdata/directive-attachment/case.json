@@ -1,0 +1,12 @@
+{
+  "mustContain": [
+    "mod first {",
+    "mod second;",
+    "mod third;",
+    "mod fourth {",
+    "const A: &str = \"a\\n\";",
+    "const B: &str = include_str!(\"b.txt\")"
+  ],
+  "mustIncludeFiles": ["first.rs", "fourth.rs", "a.txt"],
+  "mustExcludeFiles": ["second.rs", "third.rs", "b.txt"]
+}

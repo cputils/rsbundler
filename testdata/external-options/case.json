@@ -1,0 +1,11 @@
+{
+  "external": ["crate::automatic", "forced"],
+  "mustContain": ["mod automatic;", "mod forced {", "pub mod child {"],
+  "mustNotContain": ["mod forced;", "pub mod child;"],
+  "mustExcludeSources": ["crate::automatic"],
+  "expectedSources": [
+    { "modulePath": "crate", "kind": "entry", "file": "main.rs" },
+    { "modulePath": "crate::forced", "kind": "module", "file": "forced.rs" },
+    { "modulePath": "crate::forced::child", "kind": "module", "file": "child.rs" }
+  ]
+}

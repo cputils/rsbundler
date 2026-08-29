@@ -1,0 +1,6 @@
+{
+  "mustNotContain": ["source_file!()", "source_line!()", "source_column!()"],
+  "expectedSources": [
+    { "modulePath": "crate", "kind": "entry", "file": "main.rs" }
+  ]
+}

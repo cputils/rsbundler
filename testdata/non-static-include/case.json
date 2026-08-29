@@ -1,0 +1,4 @@
+{
+  "shouldFail": true,
+  "errorContains": "path must be a string literal"
+}

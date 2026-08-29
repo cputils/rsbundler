@@ -1,0 +1,9 @@
+{
+  "mustContain": ["mod child {", "mod generated; // no-bundle"],
+  "mustIncludeFiles": ["mod.rs"],
+  "mustExcludeFiles": ["generated.rs"],
+  "expectedSources": [
+    { "modulePath": "crate", "kind": "entry", "file": "main.rs" },
+    { "modulePath": "crate::child", "kind": "module", "file": "mod.rs" }
+  ]
+}

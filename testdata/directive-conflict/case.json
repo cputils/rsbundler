@@ -1,0 +1,4 @@
+{
+  "shouldFail": true,
+  "errorContains": "conflicting bundle and no-bundle directives"
+}

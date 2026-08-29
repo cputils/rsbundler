@@ -1,0 +1,5 @@
+{
+  "mustContain": ["stringified path\\n"],
+  "mustNotContain": ["include_str!(", "concat!(", "stringify!("],
+  "mustIncludeFiles": ["data.txt"]
+}

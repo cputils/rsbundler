@@ -1,0 +1,11 @@
+{
+  "mustContain": [
+    "include_str!(\"missing.txt\")",
+    "std::include_str!(concat!(\"ignored.txt\"))",
+    "include_str!(\"also-missing.txt\")",
+    "const QUALIFIED: &str = \"embedded data\\n\";",
+    "const ALIASED: &str = \"embedded data\\n\";"
+  ],
+  "mustIncludeFiles": ["child.rs", "data.txt"],
+  "mustExcludeFiles": ["missing.txt", "also-missing.txt"]
+}

@@ -1,0 +1,7 @@
+{
+  "mustContain": ["#[path = \"child.rs\"]", "mod renamed;"],
+  "mustExcludeFiles": ["child.rs", "sibling.rs"],
+  "expectedSources": [
+    { "modulePath": "crate", "kind": "entry", "file": "main.rs" }
+  ]
+}

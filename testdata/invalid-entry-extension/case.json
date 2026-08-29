@@ -1,0 +1,5 @@
+{
+  "entry": "main.txt",
+  "shouldFail": true,
+  "errorContains": "entry file must have a .rs extension"
+}

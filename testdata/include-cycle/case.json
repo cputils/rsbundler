@@ -1,0 +1,8 @@
+{
+  "skipOutputCheck": true,
+  "mustContain": ["include!(\"a.rs\")"],
+  "mustExcludeFiles": ["a.rs", "b.rs"],
+  "expectedSources": [
+    { "modulePath": "crate", "kind": "entry", "file": "main.rs" }
+  ]
+}

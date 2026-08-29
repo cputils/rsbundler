@@ -1,0 +1,7 @@
+{
+  "mustContain": ["mod child;"],
+  "mustExcludeFiles": ["mod.rs"],
+  "expectedSources": [
+    { "modulePath": "crate", "kind": "entry", "file": "main.rs" }
+  ]
+}

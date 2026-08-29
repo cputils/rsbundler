@@ -1,0 +1,21 @@
+{
+  "mustIncludeSources": [
+    "crate::data",
+    "crate::data::child",
+    "crate::math",
+    "crate::math::nested",
+    "crate::outer::inner",
+    "crate::type"
+  ],
+  "mustNotContain": ["mod math;", "mod data;"],
+  "mustAppearInOrder": ["mod data {", "mod math {", "mod outer {", "mod r#type {"],
+  "expectedSources": [
+    { "modulePath": "crate", "kind": "entry", "file": "main.rs" },
+    { "modulePath": "crate::data", "kind": "module", "file": "mod.rs" },
+    { "modulePath": "crate::data::child", "kind": "module", "file": "child.rs" },
+    { "modulePath": "crate::math", "kind": "module", "file": "math.rs" },
+    { "modulePath": "crate::math::nested", "kind": "module", "file": "nested.rs" },
+    { "modulePath": "crate::outer::inner", "kind": "module", "file": "inner.rs" },
+    { "modulePath": "crate::type", "kind": "module", "file": "type.rs" }
+  ]
+}

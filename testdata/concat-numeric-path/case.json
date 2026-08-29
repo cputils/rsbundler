@@ -1,0 +1,5 @@
+{
+  "mustContain": ["numeric concat\\n"],
+  "mustNotContain": ["include_str!(", "concat!("],
+  "mustIncludeFiles": ["10002551.20e+3-2-1.5.txt"]
+}

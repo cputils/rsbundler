@@ -1,0 +1,10 @@
+{
+  "mustContain": [
+    "pub const VALUE: &str = \"first builtin\\n\";",
+    "pub const VALUE: &str = \"child builtin\\n\";",
+    "pub const VALUE: &str = embedded!(\"missing.txt\");"
+  ],
+  "mustNotContain": ["embedded!(\"data.txt\")", "include_str!(\"child.txt\")"],
+  "mustIncludeFiles": ["child.rs", "data.txt", "child.txt"],
+  "mustExcludeFiles": ["missing.txt"]
+}

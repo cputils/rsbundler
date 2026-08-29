@@ -1,0 +1,7 @@
+{
+  "mustContain": ["include_str!(stringify!"],
+  "mustExcludeFiles": ["data.txt"],
+  "expectedSources": [
+    { "modulePath": "crate", "kind": "entry", "file": "main.rs" }
+  ]
+}

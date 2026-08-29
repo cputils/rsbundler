@@ -1,0 +1,18 @@
+{
+  "mustContain": [
+    "embedded text\\n\\n",
+    "&[0x41u8, 0x42u8, 0x43u8",
+    "as &'static [u8; 5]",
+    "as &'static [u8; 0]"
+  ],
+  "mustNotContain": ["include!(", "include_str!(", "include_bytes!("],
+  "mustIncludeFiles": ["message.txt", "bytes.bin", "empty.bin", "items.rs", "value.txt"],
+  "expectedSources": [
+    { "modulePath": "crate", "kind": "entry", "file": "main.rs" },
+    { "modulePath": "crate", "kind": "includeStr", "file": "message.txt" },
+    { "modulePath": "crate", "kind": "includeBytes", "file": "bytes.bin" },
+    { "modulePath": "crate", "kind": "includeBytes", "file": "empty.bin" },
+    { "modulePath": "crate", "kind": "include", "file": "items.rs" },
+    { "modulePath": "crate", "kind": "includeStr", "file": "value.txt" }
+  ]
+}

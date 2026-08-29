@@ -1,0 +1,9 @@
+{
+  "cfg": ["selected"],
+  "useDefaultCfg": false,
+  "rustcArgs": ["--cfg", "selected"],
+  "mustContain": ["pub const VALUE: &str = \"selected\";"],
+  "mustNotContain": ["pub const VALUE: &str = \"fallback\";"],
+  "mustIncludeFiles": ["selected.rs"],
+  "mustExcludeFiles": ["fallback.rs"]
+}

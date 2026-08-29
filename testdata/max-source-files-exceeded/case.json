@@ -1,0 +1,5 @@
+{
+  "maxSourceFiles": 1,
+  "shouldFail": true,
+  "errorContains": "source file limit of 1 exceeded"
+}

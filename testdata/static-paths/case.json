@@ -1,0 +1,7 @@
+{
+  "environment": { "ASSET_DIR": "assets" },
+  "rustcEnvironment": { "ASSET_DIR": "assets" },
+  "mustContain": ["static expression\\n"],
+  "mustNotContain": ["include_str!", "concat!(", "env!("],
+  "mustIncludeFiles": ["1truex.txt"]
+}

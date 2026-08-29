@@ -1,0 +1,8 @@
+{
+  "skipOutputCheck": true,
+  "mustContain": ["mod dependency;"],
+  "mustExcludeFiles": ["dependency.rs"],
+  "expectedSources": [
+    { "modulePath": "crate", "kind": "entry", "file": "main.rs" }
+  ]
+}

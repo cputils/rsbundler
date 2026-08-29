@@ -1,0 +1,12 @@
+{
+  "mustContain": [
+    "mod automatic {",
+    "mod kept;",
+    "mod forced {",
+    "include_str!(\"kept.txt\")",
+    "expanded include\\n"
+  ],
+  "mustNotContain": ["include_str!(\"expanded.txt\")"],
+  "mustIncludeFiles": ["automatic.rs", "forced.rs", "expanded.txt"],
+  "mustExcludeFiles": ["kept.rs", "kept.txt"]
+}

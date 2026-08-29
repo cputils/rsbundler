@@ -1,0 +1,15 @@
+{
+  "mustContain": [
+    "mod child {",
+    "pub const VALUE: &str = \"generated module\";",
+    "\"hidden include\\n\""
+  ],
+  "mustNotContain": ["mod child;", "include_str!(\"data.txt\")"],
+  "expectedSources": [
+    { "modulePath": "crate", "kind": "entry", "file": "main.rs" },
+    { "modulePath": "crate::generated", "kind": "module", "file": "mod.rs" },
+    { "modulePath": "crate::generated::child", "kind": "module", "file": "child.rs" },
+    { "modulePath": "crate::hidden_include", "kind": "module", "file": "mod.rs" },
+    { "modulePath": "crate::hidden_include", "kind": "includeStr", "file": "data.txt" }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "skipOutputCheck": true,
+  "mustContain": ["mod unavailable;", "include_str!(PATH)"],
+  "mustExcludeSources": ["crate::unavailable"],
+  "expectedSources": [
+    { "modulePath": "crate", "kind": "entry", "file": "main.rs" }
+  ]
+}

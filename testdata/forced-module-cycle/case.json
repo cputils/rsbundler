@@ -1,0 +1,4 @@
+{
+  "shouldFail": true,
+  "errorContains": "module cycle detected"
+}

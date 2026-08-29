@@ -1,0 +1,8 @@
+{
+  "noInlineIncludes": true,
+  "mustContain": ["include_str!(\"data.txt\")"],
+  "mustExcludeFiles": ["data.txt"],
+  "expectedSources": [
+    { "modulePath": "crate", "kind": "entry", "file": "main.rs" }
+  ]
+}

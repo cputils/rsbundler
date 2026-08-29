@@ -1,0 +1,4 @@
+{
+  "shouldFail": true,
+  "errorContains": "include cycle detected"
+}

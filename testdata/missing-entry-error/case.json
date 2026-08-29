@@ -1,0 +1,5 @@
+{
+  "entry": "missing.rs",
+  "shouldFail": true,
+  "errorContains": "entry file"
+}

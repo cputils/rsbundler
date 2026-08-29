@@ -1,0 +1,31 @@
+# Build Outputs
+out/
+build/
+dist/
+cache/
+artifacts/
+target/
+
+# Debug
+tmp/
+
+# Misc
+.DS_Store
+*.pem
+
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.lib
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Test
+testdata/*/bundled.rs

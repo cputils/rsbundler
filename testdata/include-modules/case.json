@@ -1,0 +1,5 @@
+{
+  "mustContain": ["mod included {", "2 * (1 + 2"],
+  "mustNotContain": ["include!("],
+  "mustIncludeFiles": ["items.rs", "included.rs", "value.rs"]
+}

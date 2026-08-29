@@ -1,0 +1,5 @@
+{
+  "mustContain": ["include_str!(\"missing.txt\")"],
+  "mustExcludeFiles": ["missing.txt"],
+  "mustIncludeFiles": ["macros.rs", "child.rs"]
+}

@@ -1,0 +1,32 @@
+{
+  "formatter": "language_server",
+  "format_on_save": "off",
+  "tab_size": 2,
+  "hard_tabs": true,
+  "ensure_final_newline_on_save": true,
+  "remove_trailing_whitespace_on_save": true,
+  "languages": {
+    "Rust": {
+      "language_servers": ["rust-analyzer"],
+      "format_on_save": "on",
+      "formatter": {
+        "language_server": {
+          "name": "rust-analyzer"
+        }
+      }
+    }
+  },
+  "lsp": {
+    "rust-analyzer": {
+      "binary": {
+        "path": "mise",
+        "arguments": ["exec", "--", "rust-analyzer"]
+      },
+      "initialization_options": {
+        "files": {
+          "exclude": ["testdata"]
+        }
+      }
+    }
+  }
+}

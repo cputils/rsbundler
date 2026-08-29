@@ -1,0 +1,5 @@
+{
+  "mustContain": ["mod unavailable;", "mod available {", "include_str!(MISSING_PATH)"],
+  "mustIncludeFiles": ["available.rs"],
+  "mustExcludeFiles": ["unavailable.rs"]
+}

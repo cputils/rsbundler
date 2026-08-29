@@ -1,0 +1,5 @@
+{
+  "skipOutputCheck": true,
+  "mustContain": ["mod dependency {", "pub const VALUE: usize = 1;"],
+  "mustIncludeFiles": ["dependency.rs"]
+}

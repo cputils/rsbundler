@@ -1,0 +1,4 @@
+{
+  "mustContain": ["std::include_str!(\"missing.txt\")"],
+  "mustExcludeFiles": ["missing.txt"]
+}

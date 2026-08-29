@@ -1,0 +1,137 @@
+# rsbundler
+
+[English](README.md) | 日本語
+
+**rsbundler** は、Rust のクレートルートとローカルなソースファイル依存関係を、1 つの Rust ソースへまとめます。構文解析器は実行ファイルへリンクされており、バンドル時に `rustc`、`cargo`、`rustfmt`、その他の外部コマンドを起動しません。
+
+## クイックスタート
+
+リポジトリからコマンドをインストールします。
+
+```sh
+cargo install --git https://github.com/cputils/rsbundler rsbundler
+```
+
+バイナリクレートのルートをバンドルします。
+
+```sh
+rsbundler src/main.rs --output bundled.rs
+```
+
+`--output` を省略すると、生成ソースは標準出力へ書き込まれます。
+
+```sh
+rsbundler src/main.rs > bundled.rs
+```
+
+`rsbundler` の実行時に Rust ツールチェーンは不要です。当然ながら、生成した `.rs` を後からコンパイルするときには Rust コンパイラが必要です。
+
+## 動作原理
+
+1. 実行ファイルへ組み込んだ rust-analyzer の構文解析器でクレートルートを解析します。
+2. Rust のファイル解決規則に従って、外部ファイルの `mod name;` 宣言をたどります。
+3. 各宣言のセミコロンだけを inline module の本体へ置換し、可視性、属性、コメント、元のソーステキストを維持します。
+4. デフォルトでは、静的な `include!`、`include_str!`、`include_bytes!` の参照ファイルも埋め込みます。
+
+抽象構文木からソース全体を再出力する方式ではありません。展開に必要な範囲だけを置換するため、それ以外のコメント、raw 文字列、空白、改行コードはそのまま保たれます。
+
+## 対応するソース解決
+
+- `name.rs` と `name/mod.rs`（両方が存在する場合の曖昧性検出を含む）
+- flat module、`mod.rs`、inline module 内のネストした外部ファイル module
+- `mod r#type;` のような raw identifier
+- `#[path = "..."]` と有効な `cfg_attr(..., path = "...")`（通常とは異なる子 module の解決規則も含む）
+- Rust item 群または 1 つの式を含む、静的でネスト可能な `include!`
+- 任意の UTF-8 テキストに対する `include_str!` と、任意のバイト列に対する `include_bytes!`
+- リテラル、括弧、`concat!`、`env!`、`stringify!` からなる include パス
+- `concat!` 内の文字列、文字、整数（非10進・suffix付きも含む）、浮動小数点数、真偽値、負数リテラル
+- `std::include_str!` のような修飾済み標準マクロと、`use std::include_str as embedded` のような明示的alias
+- 明示的な標準aliasを含む直接の `file!`、`line!`、`column!`（ソースを移動する前に元の値へ置換）
+- `macro_rules!` transcriber 内の、静的にparseできるmodule / include依存
+- ターゲットを考慮した `cfg`、`all`、`any`、`not`、ネストした `cfg_attr` の評価
+- UTF-8 BOM とソースファイルの shebang
+- rollback可能な循環参照検出と、依存ソースファイル数の上限
+
+外部 crate と `use` 宣言は変更しません。Cargo metadata を実行したり、サードパーティー crate をソースへコピーしたりすることもありません。
+
+## バンドル制御
+
+pybundler と同様に、通常コメントの同じ行、または単独コメントとして直前の行にある `bundle` / `no-bundle` を認識します。
+
+```rust
+mod embedded; // bundle
+
+// no-bundle
+mod generated_at_build_time;
+
+const SCHEMA: &str = include_str!(SCHEMA_PATH); // no-bundle
+```
+
+`// no-bundle` は宣言またはマクロ呼び出しを必ず変更せず残します。その構文を移動すると相対パスやソース位置が変わる場合は、直近の外側のファイル依存も保持します。`// bundle` は静的展開を強制し、`--external` より優先され、依存を解決できなければエラーを返します。内側の `// no-bundle` は、外側の依存に指定した `// bundle` よりも優先されます。同じ依存に両方を指定するとエラーです。どちらもない場合、安全に解決できる依存は展開し、非対応・欠落・曖昧・動的計算・循環している依存はトランザクション単位で巻き戻して、エラーにせず保持します。
+
+`-e, --external <MODULE>` はトップレベルmoduleとその配下を保持します。複数指定でき、`name` と `crate::name` の両方を受け付けます。その宣言に `// bundle` があれば、moduleと推移的なローカルmoduleを取り込みます。
+
+### 条件付きコンパイル
+
+rsbundler は条件属性を評価してから依存を解決します。デフォルトでは、rsbundler 実行ファイルのコンパイル対象になったターゲットの cfg 値を実行ファイル内へ埋め込み、実行時にコンパイラを起動せず利用します。アプリ固有の値は `--cfg name` または `--cfg 'key="value"'` を繰り返して追加できます。クロスターゲット用には `--no-default-cfg` と完全な cfg 一式を指定してください。
+
+無効な依存は変更せず、ファイルも読みません。有効な `cfg_attr(..., path = "...")` は通常のRust module解決に使います。属性自体は生成ソースへ残りますが、inline化された本体はバンドル時に選んだ cfg 専用です。生成物も同じ cfg 一式でコンパイルしてください。
+
+## 精度上の境界
+
+コンパイラ相当のマクロ展開と名前解決を行わない限り、次の動作は完全には再現できません。
+
+- metavariableを含む `macro_rules!` transcriberが、呼び出しや周囲のscopeに応じて依存を選ぶ場合
+- 手続き的マクロが依存を生成したり、inline moduleと外部ファイルmoduleを区別したりする場合
+- 任意のユーザー定義・外部マクロがincludeやソース位置依存の組み込みマクロへ展開される場合
+- entryファイル内のマクロに位置依存マクロが隠れており、保持できる外側のファイル依存がない場合
+
+ユーザー定義・import済みのマクロ名は保守的に追跡します。シャドーイングの可能性がある未修飾のinclude、静的パス、位置マクロは保持し、修飾済み標準パスと曖昧でない標準aliasは展開できます。`macro_rules!` transcriber内のparse可能な依存構文は展開し、context依存のtranscriberは移動が危険な場合に外側の依存ごと保持します。未知の属性マクロが付いたmoduleも自動では保持します。認識された構文をinline化して安全だと利用者が保証できる場合にだけ `// bundle` を追加してください。
+
+直接の `file!`、`line!`、`column!` は元の値を正確に維持します。マクロtranscriber内に隠れている場合は、誤った定義位置の値へ置換せず、外側のmoduleまたはincludeを保持します。crate entryには保持できる親依存がないため、entry自体を変更せず返します。このテキストを別のファイル名でコンパイルすると、隠れた `file!` の値だけは変わり得ます。この場合を完全に再現するにはユーザーマクロの展開が必要です。
+
+保持された `mod` とinclude構文は、引き続き元のファイルへ依存します。部分的なinline化で相対パスの基準が変わる場合、rsbundlerはより外側の依存を保持しますが、トップレベルで保持されたパスは生成ファイルの配置場所を基準に解釈されます。`no-bundle`、`external`、自動保持を使う場合は、entryの隣へ出力するか、必要な相対配置を維持してください。すべて展開できた生成物には、このローカルなビルド時ソース依存はありません。
+
+pybundler のinterpreter / sys.path境界オプションは、すべてのRustファイルmoduleが明示的に宣言されるため対応物がありません。Python importのtree shakingも、Rustコンパイラが不要コードを除去し、ソース段階の削除は安全でないため実装しません。formatは `rustfmt` の起動が外部ランタイム非依存の保証に反するため行いません。Cargo依存をコピーしないため、パッケージlicenseの埋め込みも対象外です。
+
+## CLI オプション
+
+| オプション                   | 説明                                                         | デフォルト  |
+| ---------------------------- | ------------------------------------------------------------ | ----------- |
+| `-o, --output <FILE>`        | 標準出力ではなくファイルへ書き込む                           | 標準出力    |
+| `--edition <EDITION>`        | Rust `2015`、`2018`、`2021`、`2024` のいずれかとして解析する | `2024`      |
+| `--max-source-files <COUNT>` | entry を除く、展開する module / include ファイル数を制限する | `2048`      |
+| `-e, --external <MODULE>`    | トップレベルmoduleを保持する（複数指定可）                   | なし        |
+| `--cfg <SPEC>`               | 有効なcfgへ `name` / `key=value` を追加する（複数指定可）    | なし        |
+| `--no-default-cfg`           | rsbundlerのビルドターゲット用cfgを使わない                   | 無効        |
+| `--env <KEY=VALUE>`          | 静的includeパス内の `env!` 値を設定する                      | process環境 |
+| `--no-inline-includes`       | 3 種類の組み込み include マクロを生成コードへ残す            | 無効        |
+
+完全なヘルプは `rsbundler --help` で確認できます。
+
+## Rust ライブラリ
+
+`Cargo.toml` に rsbundler を追加します。
+
+```toml
+[dependencies]
+rsbundler = { git = "https://github.com/cputils/rsbundler", tag = "<version>" }
+```
+
+次に `bundle_file` を呼び出します。
+
+```rust
+use rsbundler::{BundleOptions, bundle_file};
+
+let result = bundle_file("src/main.rs", BundleOptions::default())?;
+std::fs::write("bundled.rs", result.code)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`BundleResult` には、正規化された entry の絶対パスと、バンドルに使ったすべての module / include ファイルの決定的なメタデータも含まれます。
+
+`BundleOptions` にはedition、ファイル数上限、include制御に加え、対応する `external`、`cfg`、`use_default_cfg`、`environment` フィールドがあります。optionsで指定した環境値はrsbundler processの環境変数より優先されます。
+
+## ライセンス
+
+MIT

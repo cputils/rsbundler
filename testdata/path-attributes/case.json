@@ -1,0 +1,17 @@
+{
+  "mustIncludeSources": [
+    "crate::imp",
+    "crate::imp::nested",
+    "crate::imp::default_child",
+    "crate::container::child"
+  ],
+  "mustIncludeFiles": ["implementation.rs", "nested.rs", "child.rs"],
+  "mustNotContain": ["mod imp;", "mod child;"],
+  "expectedSources": [
+    { "modulePath": "crate", "kind": "entry", "file": "main.rs" },
+    { "modulePath": "crate::imp", "kind": "module", "file": "implementation.rs" },
+    { "modulePath": "crate::imp::nested", "kind": "module", "file": "nested.rs" },
+    { "modulePath": "crate::imp::default_child", "kind": "module", "file": "default_child.rs" },
+    { "modulePath": "crate::container::child", "kind": "module", "file": "child.rs" }
+  ]
+}
