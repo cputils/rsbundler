@@ -1,0 +1,2 @@
+[env]
+RUSTC_BOOTSTRAP = "ra_ap_proc_macro_api,ra_ap_proc_macro_srv"

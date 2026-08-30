@@ -1,0 +1,24 @@
+{
+  "procMacros": [
+    { "crateName": "fixture_macros", "source": "macros.rs" }
+  ],
+  "mustContain": [
+    "mod dependency {",
+    "pub const VALUE: usize = 2;",
+    "pub const ATTRIBUTE_VALUE : usize = 5",
+    "#[derive(Debug)]",
+    "impl Marker",
+    "const PROC_VALUE: usize = (7"
+  ],
+  "mustNotContain": [
+    "fixture_macros::",
+    "include!(\"generated/value.rs\")",
+    "mod dependency;"
+  ],
+  "mustIncludeFiles": ["dependency.rs", "value.rs"],
+  "expectedSources": [
+    { "modulePath": "crate", "kind": "entry", "file": "main.rs" },
+    { "modulePath": "crate::dependency", "kind": "module", "file": "dependency.rs" },
+    { "modulePath": "crate", "kind": "include", "file": "value.rs" }
+  ]
+}

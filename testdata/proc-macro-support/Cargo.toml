@@ -1,0 +1,15 @@
+[package]
+name = "proc-macro-support"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+fixture_macros = { package = "fixture-macro-implementation", path = "macros" }
+
+[[bin]]
+name = "proc-macro-support"
+path = "main.rs"
+
+[workspace]
+members = ["macros"]
+resolver = "3"

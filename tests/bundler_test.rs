@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use rsbundler::{BundleOptions, BundledSource, BundledSourceKind, RustEdition, bundle_file};
+use rsbundler::{
+    BundleOptions, BundledSource, BundledSourceKind, ProcMacroDylib, RustEdition, bundle_file,
+};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Default)]
@@ -18,6 +20,8 @@ struct BundleScenario {
     #[serde(rename = "noInlineIncludes")]
     no_inline_includes: bool,
     environment: HashMap<String, String>,
+    #[serde(rename = "procMacros")]
+    proc_macros: Vec<ProcMacroFixture>,
     #[serde(rename = "shouldFail")]
     should_fail: bool,
     #[serde(rename = "errorContains")]
@@ -84,6 +88,13 @@ struct RuntimeCheck {
     should_compile: Option<bool>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcMacroFixture {
+    crate_name: String,
+    source: String,
+}
+
 struct RuntimeJob {
     scenario_name: String,
     project_root: PathBuf,
@@ -93,6 +104,7 @@ struct RuntimeJob {
     rustc_args: Vec<String>,
     rustc_environment: HashMap<String, String>,
     should_compile: Option<bool>,
+    proc_macros: Vec<ProcMacroFixture>,
 }
 
 #[test]
@@ -142,6 +154,7 @@ fn execute_scenario(
     project_root: &Path,
     scenario: &BundleScenario,
 ) {
+    let proc_macros = compile_proc_macros(scenario_name, project_root, &scenario.proc_macros);
     let result = bundle_file(
         project_root.join(&scenario.entry),
         BundleOptions {
@@ -154,6 +167,7 @@ fn execute_scenario(
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
+            proc_macros,
         },
     );
 
@@ -195,6 +209,7 @@ fn build_runtime_jobs(scenario_names: &[String]) -> Vec<RuntimeJob> {
                 rustc_args: scenario.rustc_args,
                 rustc_environment: scenario.rustc_environment,
                 should_compile: None,
+                proc_macros: scenario.proc_macros,
             });
         } else {
             assert!(
@@ -211,6 +226,7 @@ fn build_runtime_jobs(scenario_names: &[String]) -> Vec<RuntimeJob> {
                     rustc_args: check.rustc_args.clone(),
                     rustc_environment: check.rustc_environment.clone(),
                     should_compile: check.should_compile,
+                    proc_macros: scenario.proc_macros.clone(),
                 });
             }
         }
@@ -394,6 +410,25 @@ fn check_runtime_output(job: &RuntimeJob) {
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
+    let proc_macros = compile_proc_macros(&job.scenario_name, &job.project_root, &job.proc_macros);
+    let proc_macro_args = proc_macros
+        .iter()
+        .flat_map(|proc_macro| {
+            [
+                "--extern".to_owned(),
+                format!(
+                    "{}={}",
+                    proc_macro.crate_name,
+                    proc_macro.dylib_path.display()
+                ),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let original_rustc_args = rustc_args
+        .iter()
+        .copied()
+        .chain(proc_macro_args.iter().map(String::as_str))
+        .collect::<Vec<_>>();
     let environment = job
         .rustc_environment
         .iter()
@@ -403,7 +438,7 @@ fn check_runtime_output(job: &RuntimeJob) {
         &job.project_root.join(&job.entry),
         &output_root.join(executable_name(&format!("original-{}", job.check_name))),
         &job.edition,
-        &rustc_args,
+        &original_rustc_args,
         &environment,
     );
     let bundled = compile_and_run(
@@ -452,6 +487,48 @@ fn check_runtime_output(job: &RuntimeJob) {
             job.scenario_name, job.check_name
         );
     }
+}
+
+fn compile_proc_macros(
+    scenario_name: &str,
+    project_root: &Path,
+    fixtures: &[ProcMacroFixture],
+) -> Vec<ProcMacroDylib> {
+    if fixtures.is_empty() {
+        return Vec::new();
+    }
+    let output_root = temporary_test_dir(scenario_name).join("proc-macros");
+    fs::create_dir_all(&output_root).expect("create proc-macro output directory");
+    fixtures
+        .iter()
+        .map(|fixture| {
+            let dylib_path = output_root.join(format!(
+                "{}{}{}",
+                std::env::consts::DLL_PREFIX,
+                fixture.crate_name,
+                std::env::consts::DLL_SUFFIX
+            ));
+            let output = Command::new("rustc")
+                .args(["--edition=2024", "--crate-type=proc-macro", "--crate-name"])
+                .arg(&fixture.crate_name)
+                .arg(project_root.join(&fixture.source))
+                .arg("-o")
+                .arg(&dylib_path)
+                .output()
+                .unwrap_or_else(|error| {
+                    panic!("compile proc-macro fixture for {scenario_name}: {error}")
+                });
+            assert!(
+                output.status.success(),
+                "compile proc-macro fixture for {scenario_name}:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            ProcMacroDylib {
+                crate_name: fixture.crate_name.clone(),
+                dylib_path,
+            }
+        })
+        .collect()
 }
 
 fn compile_and_run(

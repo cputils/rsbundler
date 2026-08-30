@@ -29,9 +29,10 @@ rsbundler src/main.rs > bundled.rs
 ## 動作原理
 
 1. 実行ファイルへ組み込んだ rust-analyzer の構文解析器でクレートルートを解析します。
-2. Rust のファイル解決規則に従って、外部ファイルの `mod name;` 宣言をたどります。
-3. 各宣言のセミコロンだけを inline module の本体へ置換し、可視性、属性、コメント、元のソーステキストを維持します。
-4. デフォルトでは、静的な `include!`、`include_str!`、`include_bytes!` の参照ファイルも埋め込みます。
+2. Cargoプロジェクトの既存build成果物からコンパイル済み手続き型マクロライブラリを検出し、属性・derive・関数形式マクロを同一process内で展開します。
+3. Rust のファイル解決規則に従って、外部ファイルの `mod name;` 宣言をたどります。
+4. 各宣言のセミコロンだけを inline module の本体へ置換し、可視性、属性、コメント、元のソーステキストを維持します。
+5. デフォルトでは、静的な `include!`、`include_str!`、`include_bytes!` の参照ファイルも埋め込みます。
 
 抽象構文木からソース全体を再出力する方式ではありません。展開に必要な範囲だけを置換するため、それ以外のコメント、raw 文字列、空白、改行コードはそのまま保たれます。
 
@@ -48,11 +49,37 @@ rsbundler src/main.rs > bundled.rs
 - `std::include_str!` のような修飾済み標準マクロと、`use std::include_str as embedded` のような明示的alias
 - 明示的な標準aliasを含む直接の `file!`、`line!`、`column!`（ソースを移動する前に元の値へ置換）
 - `macro_rules!` transcriber 内の、静的にparseできるmodule / include依存
+- Cargo build成果物から自動検出するか、host dylibで明示的に上書きした属性・derive・関数形式の手続き型マクロ
 - `cfg`、`all`、`any`、`not`、ネストした `cfg_attr` 分岐のターゲット非依存な展開
 - UTF-8 BOM とソースファイルの shebang
 - rollback可能な循環参照検出と、依存ソースファイル数の上限
 
 外部 crate と `use` 宣言は変更しません。Cargo metadata を実行したり、サードパーティー crate をソースへコピーしたりすることもありません。
+
+## 手続き型マクロ
+
+通常、proc-macro用のoptionは不要です。先にCargoプロジェクトをbuildしてから、crate rootをbundleします。
+
+```sh
+cargo build
+rsbundler src/main.rs --output bundled.rs
+```
+
+rsbundlerはentryファイルを起点に、所属packageとworkspaceのmanifestを検出し、dependencyのrenameを読み取り、既存のCargo成果物directoryを探索します。`CARGO_TARGET_DIR` と `[build].target-dir` に対応し、それらがなければpackageとworkspaceの `target` directoryをdebug、release、custom profileの順で探索します。Cargoやrustcを起動せず、欠けている成果物をbuildすることもありません。
+
+非標準の配置を使う場合や自動選択した成果物を上書きする場合は、コンパイル済みproc-macro dylibを `CRATE=DYLIB` 形式で指定します。crate名は呼び出し元ソースで使うpathの先頭segmentです。このoptionは複数回指定できます。
+
+```sh
+rsbundler src/main.rs \
+  --proc-macro my_macros=target/debug/deps/libmy_macros-abc123.so \
+  --output bundled.rs
+```
+
+rsbundlerは各ライブラリからmacro exportを読み取り、通常のソース依存探索より前に、登録済みの属性マクロ、custom derive、関数形式マクロを展開します。macro出力も再帰的に処理するため、生成された `mod`、`include!`、別の登録済み手続き型マクロも同じbundleへ取り込まれます。`#[my_macros::transform]` のような修飾済み呼び出しは、検出したdependency名または明示的な上書き名で照合します。未修飾名は、その種類でロード済みのmacroを一意に特定できる場合に展開します。衝突する場合はcrate pathで修飾してください。
+
+Rustのproc-macro dylib ABIは不安定なため、dylibはhost platform向けで、rsbundler実行ファイルと完全に同じ `rustc` versionでコンパイルされている必要があります。明示指定したdylibのABIが一致しない場合は、期待versionと実際のversionを示して拒否し、自動検出した非互換の候補はskipします。rsbundlerはCargo、rustc、外部proc-macro serverを起動しません。proc-macro host、成果物探索、それらのRust依存ライブラリはrsbundlerバイナリへリンクされ、実行時にロードするのはプロジェクト内のdylibだけです。手続き型マクロはnative codeとしてrsbundlerと同じ権限で動作するため、信頼できるプロジェクトと成果物だけをbundleしてください。
+
+`--env KEY=VALUE` の値は手続き型マクロにも渡します。current directoryはentryソースのdirectoryです。`cfg_attr`から間接的に選ばれるmacro、compilerが提供するderive、完全なcompiler名前解決を必要とするmacroは、この構文的展開modelの対象外です。未展開の属性には、従来どおり保守的なmodule保持を適用します。
 
 ## バンドル制御
 
@@ -79,10 +106,10 @@ rsbundler はコンパイル対象を選択せず、自身をコンパイルし�
 
 ## 精度上の境界
 
-コンパイラ相当のマクロ展開と名前解決を行わない限り、次の動作は完全には再現できません。
+コンパイラ相当の完全な名前解決を行わない限り、次の動作は完全には再現できません。
 
 - metavariableを含む `macro_rules!` transcriberが、呼び出しや周囲のscopeに応じて依存を選ぶ場合
-- 手続き的マクロが依存を生成したり、inline moduleと外部ファイルmoduleを区別したりする場合
+- 未設定または条件付きで選択される手続き型マクロが依存を生成したり、inline moduleと外部ファイルmoduleを区別したりする場合
 - 任意のユーザー定義・外部マクロがincludeやソース位置依存の組み込みマクロへ展開される場合
 - entryファイル内のマクロに位置依存マクロが隠れており、保持できる外側のファイル依存がない場合
 
@@ -96,14 +123,15 @@ pybundler のinterpreter / sys.path境界オプションは、すべてのRust�
 
 ## CLI オプション
 
-| オプション                   | 説明                                                         | デフォルト  |
-| ---------------------------- | ------------------------------------------------------------ | ----------- |
-| `-o, --output <FILE>`        | 標準出力ではなくファイルへ書き込む                           | 標準出力    |
-| `--edition <EDITION>`        | Rust `2015`、`2018`、`2021`、`2024` のいずれかとして解析する | `2024`      |
-| `--max-source-files <COUNT>` | entry を除く、展開する module / include ファイル数を制限する | `2048`      |
-| `-e, --external <MODULE>`    | トップレベルmoduleを保持する（複数指定可）                   | なし        |
-| `--env <KEY=VALUE>`          | 静的includeパス内の `env!` 値を設定する                      | process環境 |
-| `--no-inline-includes`       | 3 種類の組み込み include マクロを生成コードへ残す            | 無効        |
+| オプション                   | 説明                                                                | デフォルト  |
+| ---------------------------- | ------------------------------------------------------------------- | ----------- |
+| `-o, --output <FILE>`        | 標準出力ではなくファイルへ書き込む                                  | 標準出力    |
+| `--edition <EDITION>`        | Rust `2015`、`2018`、`2021`、`2024` のいずれかとして解析する        | `2024`      |
+| `--max-source-files <COUNT>` | entry を除く、展開する module / include ファイル数を制限する        | `2048`      |
+| `-e, --external <MODULE>`    | トップレベルmoduleを保持する（複数指定可）                          | なし        |
+| `--env <KEY=VALUE>`          | 静的includeパスの `env!` 値と手続き型マクロの環境overrideを設定する | process環境 |
+| `--proc-macro <CRATE=DYLIB>` | 自動検出した手続き型マクロを上書き（複数指定可）                    | 自動検出    |
+| `--no-inline-includes`       | 3 種類の組み込み include マクロを生成コードへ残す                   | 無効        |
 
 完全なヘルプは `rsbundler --help` で確認できます。
 
@@ -128,7 +156,7 @@ std::fs::write("bundled.rs", result.code)?;
 
 `BundleResult` には、正規化された entry の絶対パスと、バンドルに使ったすべての module / include ファイルの決定的なメタデータも含まれます。
 
-`BundleOptions` にはedition、ファイル数上限、include制御に加え、対応する `external`、`environment` フィールドがあります。optionsで指定した環境値はrsbundler processの環境変数より優先されます。
+`BundleOptions` にはedition、ファイル数上限、include制御に加え、対応する `external`、`environment`、`proc_macros` フィールドがあります。defaultでは既存のCargo成果物を自動検出し、source上のcrate pathとコンパイル済みライブラリを上書きするときだけ `ProcMacroDylib` を追加します。optionsで指定した環境値はrsbundler processの環境変数より優先され、`CARGO_TARGET_DIR` の探索と手続き型マクロの展開時にも参照できます。
 
 ## ライセンス
 

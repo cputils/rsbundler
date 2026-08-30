@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ra_ap_syntax::Edition;
 
@@ -16,6 +16,10 @@ mod include;
 mod macro_rules;
 #[path = "module_resolver.rs"]
 mod module_resolver;
+#[path = "proc_macro.rs"]
+mod proc_macro;
+#[path = "proc_macro_discovery.rs"]
+mod proc_macro_discovery;
 #[path = "source.rs"]
 mod source;
 
@@ -56,6 +60,8 @@ pub struct BundleOptions {
     pub external: Vec<String>,
     /// Compile-time environment values available to statically evaluated `env!` calls.
     pub environment: Vec<(String, String)>,
+    /// Compiled procedural-macro libraries that override automatic discovery.
+    pub proc_macros: Vec<ProcMacroDylib>,
 }
 
 impl Default for BundleOptions {
@@ -66,8 +72,21 @@ impl Default for BundleOptions {
             inline_includes: true,
             external: Vec::new(),
             environment: Vec::new(),
+            proc_macros: Vec::new(),
         }
     }
+}
+
+/// A compiled procedural-macro library and the crate path used to invoke it.
+///
+/// Explicit entries override matching libraries discovered from Cargo build
+/// artifacts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcMacroDylib {
+    /// First path segment used for qualified macro invocations.
+    pub crate_name: String,
+    /// Path to a host proc-macro dylib compiled by the same `rustc` as rsbundler.
+    pub dylib_path: PathBuf,
 }
 
 /// How a source dependency entered the generated bundle.
@@ -104,10 +123,12 @@ pub struct BundleResult {
 
 /// Bundles a Rust crate root and its local source-file dependencies.
 ///
-/// The bundler uses an embedded rust-analyzer parser and never invokes `cargo`,
-/// `rustc`, or another external executable. Out-of-line module declarations are
+/// The bundler uses an embedded rust-analyzer parser and proc-macro host and
+/// never invokes `cargo`, `rustc`, or another external executable. Configured
+/// procedural macros are discovered from Cargo build artifacts or loaded from
+/// configured dylibs and expanded before out-of-line module declarations are
 /// converted to inline modules. Static include macros are embedded by default.
-/// All source text outside those replacement ranges is retained byte-for-byte.
+/// All source text outside replacement ranges is retained byte-for-byte.
 /// Dependencies marked `// no-bundle`, configured as external, or not safely
 /// resolvable by static analysis are retained unchanged. `// bundle` forces one
 /// dependency to be expanded and turns a resolution failure into an error.

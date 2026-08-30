@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ra_ap_proc_macro_srv::EnvSnapshot;
 use ra_ap_syntax::{AstNode, SourceFile, SyntaxNode, ast};
 
 use super::cfg::{CfgExpr, syntax_is_active};
@@ -18,6 +19,7 @@ use super::module_resolver::{
     module_inlining_condition, module_path_is_external, normalize_external_name,
     qualified_module_path,
 };
+use super::proc_macro::ProcMacroExpander;
 use super::source::{
     canonical_file, display_path, format_parse_errors, read_rust_source, resolve_entry_file,
     source_position,
@@ -30,7 +32,12 @@ pub(super) fn bundle_file(
 ) -> Result<BundleResult, String> {
     let entry = resolve_entry_file(entry_file)?;
     let context = SourceContext::for_crate_root(&entry.logical)?;
-    let mut state = Bundler::new(options, context.physical_dir.clone())?;
+    let proc_macro_environment = EnvSnapshot::default();
+    let mut state = Bundler::new(
+        options,
+        context.physical_dir.clone(),
+        &proc_macro_environment,
+    )?;
     state.sources.push(BundledSource {
         file_path: display_path(&entry.canonical),
         module_path: "crate".to_owned(),
@@ -69,8 +76,7 @@ pub(super) fn bundle_file(
     })
 }
 
-#[derive(Debug)]
-struct Bundler {
+struct Bundler<'env> {
     options: BundleOptions,
     environment: HashMap<String, String>,
     external: HashSet<String>,
@@ -80,6 +86,7 @@ struct Bundler {
     active_includes: Vec<PathBuf>,
     exported_macros: HashSet<String>,
     bundle_dir: PathBuf,
+    proc_macros: ProcMacroExpander<'env>,
 }
 
 #[derive(Debug)]
@@ -178,14 +185,25 @@ impl RetentionSafety {
     }
 }
 
-impl Bundler {
-    fn new(options: BundleOptions, bundle_dir: PathBuf) -> Result<Self, String> {
+impl<'env> Bundler<'env> {
+    fn new(
+        options: BundleOptions,
+        bundle_dir: PathBuf,
+        proc_macro_environment: &'env EnvSnapshot,
+    ) -> Result<Self, String> {
         let environment = options.environment.iter().cloned().collect();
         let external = options
             .external
             .iter()
             .map(|name| normalize_external_name(name, options.edition.into()))
             .collect::<Result<HashSet<_>, _>>()?;
+        let proc_macros = ProcMacroExpander::new(
+            &options.proc_macros,
+            options.environment.clone(),
+            bundle_dir.clone(),
+            proc_macro_environment,
+            options.edition.into(),
+        )?;
         Ok(Self {
             options,
             environment,
@@ -196,6 +214,7 @@ impl Bundler {
             active_includes: Vec::new(),
             exported_macros: HashSet::new(),
             bundle_dir,
+            proc_macros,
         })
     }
 
@@ -289,15 +308,19 @@ impl Bundler {
         site: &SourceSite<'_>,
     ) -> ExpansionResult<String> {
         let edition = self.options.edition.into();
-        let parsed = SourceFile::parse(source, edition);
+        let source = self
+            .proc_macros
+            .expand_source(file_path, source, edition)
+            .map_err(ExpansionError::fatal)?;
+        let parsed = SourceFile::parse(&source, edition);
         if !parsed.errors().is_empty() {
             return Err(ExpansionError::recoverable(format_parse_errors(
                 file_path,
-                source,
+                &source,
                 &parsed.errors(),
             )));
         }
-        self.bundle_syntax(file_path, source, parsed.tree().syntax(), site)
+        self.bundle_syntax(file_path, &source, parsed.tree().syntax(), site)
     }
 
     fn bundle_syntax(

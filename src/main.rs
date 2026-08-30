@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
-use rsbundler::{BundleOptions, RustEdition, bundle_file};
+use rsbundler::{BundleOptions, ProcMacroDylib, RustEdition, bundle_file};
 
 /// Bundle a Rust crate's local source dependencies into one source file.
 #[derive(Debug, Parser)]
@@ -31,6 +31,10 @@ struct Cli {
     /// Set a compile-time environment value used by env! in include paths.
     #[arg(long, value_name = "KEY=VALUE")]
     env: Vec<String>,
+
+    /// Override an automatically discovered procedural macro with CRATE=DYLIB.
+    #[arg(long, value_name = "CRATE=DYLIB")]
+    proc_macro: Vec<String>,
 
     /// Leave include!, include_str!, and include_bytes! unchanged.
     #[arg(long)]
@@ -84,6 +88,24 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok((key.to_owned(), value.to_owned()))
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let proc_macros = cli
+        .proc_macro
+        .iter()
+        .map(|value| {
+            let (crate_name, dylib_path) = value
+                .split_once('=')
+                .ok_or_else(|| format!("--proc-macro requires CRATE=DYLIB, found {value:?}"))?;
+            if crate_name.is_empty() || dylib_path.is_empty() {
+                return Err(format!(
+                    "--proc-macro requires non-empty CRATE and DYLIB, found {value:?}"
+                ));
+            }
+            Ok(ProcMacroDylib {
+                crate_name: crate_name.to_owned(),
+                dylib_path: dylib_path.into(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let result = bundle_file(
         &cli.entry,
         BundleOptions {
@@ -92,6 +114,7 @@ fn run(cli: Cli) -> Result<(), String> {
             inline_includes: !cli.no_inline_includes,
             external: cli.external,
             environment,
+            proc_macros,
         },
     )?;
 
