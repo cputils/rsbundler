@@ -1,0 +1,4 @@
+{
+  "mustNotContain": ["include_str!", "concat!"],
+  "mustIncludeFiles": ["1.txt"]
+}

@@ -1,0 +1,4 @@
+{
+  "mustNotContain": ["mod child;", "r#include_str!", "r#line!"],
+  "mustIncludeFiles": ["child.rs", "data.txt"]
+}

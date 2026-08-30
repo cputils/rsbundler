@@ -8,10 +8,11 @@ use super::cfg::{CfgExpr, syntax_is_active};
 use super::directive::{BundleDirective, bundle_directive};
 use super::edit::{ByteRange, Edit, apply_edits, byte_range, overlaps_any};
 use super::include::{
-    IncludeKind, LocationMacroKind, MacroScope, byte_string_expression, include_macro_kind,
-    location_macro_kind, resolve_location_macro_path, static_include_argument,
+    IncludeKind, LocationMacroKind, MacroScope, byte_string_expression, exported_macro_names,
+    implicit_standard_crates, include_macro_kind, location_macro_kind, resolve_include_macro_path,
+    resolve_location_macro_path, static_include_argument,
 };
-use super::macro_rules::{hidden_location_macros, relevant_transcribers};
+use super::macro_rules::{hidden_location_macros, hidden_macro_calls, relevant_transcribers};
 use super::module_resolver::{
     ModuleFileVariant, SourceContext, containing_module_path, module_file_variants,
     module_inlining_condition, module_path_is_external, normalize_external_name,
@@ -37,6 +38,13 @@ pub(super) fn bundle_file(
     });
 
     let source = read_rust_source(&entry.canonical, true)?;
+    state.discover_exported_macros(&entry.canonical, &context, &source, &mut HashSet::new());
+    let entry_scope = {
+        let parsed = SourceFile::parse(&source, state.options.edition.into());
+        let tree = parsed.tree();
+        let (std, core) = implicit_standard_crates(tree.syntax());
+        MacroScope::default().with_standard_crates(std, core)
+    };
     state.active_modules.push(entry.canonical.clone());
     let code = state
         .bundle_rust_source(
@@ -47,7 +55,7 @@ pub(super) fn bundle_file(
                 context: &context,
                 module_path: "crate",
                 external_admitted: false,
-                macro_scope: &MacroScope::default(),
+                macro_scope: &entry_scope,
                 retention: RetentionSafety::entry(),
             },
         )
@@ -70,6 +78,7 @@ struct Bundler {
     source_file_count: usize,
     active_modules: Vec<PathBuf>,
     active_includes: Vec<PathBuf>,
+    exported_macros: HashSet<String>,
     bundle_dir: PathBuf,
 }
 
@@ -185,8 +194,92 @@ impl Bundler {
             source_file_count: 0,
             active_modules: Vec::new(),
             active_includes: Vec::new(),
+            exported_macros: HashSet::new(),
             bundle_dir,
         })
+    }
+
+    fn discover_exported_macros(
+        &mut self,
+        file_path: &Path,
+        context: &SourceContext,
+        source: &str,
+        visited: &mut HashSet<PathBuf>,
+    ) {
+        if !visited.insert(file_path.to_path_buf()) {
+            return;
+        }
+        let parsed = SourceFile::parse(source, self.options.edition.into());
+        if !parsed.errors().is_empty() {
+            return;
+        }
+        let tree = parsed.tree();
+        let root = tree.syntax();
+        self.exported_macros.extend(exported_macro_names(root));
+
+        for module in root.descendants().filter_map(ast::Module::cast) {
+            if module.semicolon_token().is_none() {
+                continue;
+            }
+            let Ok(variants) = module_file_variants(&module, context, file_path) else {
+                continue;
+            };
+            for variant in variants {
+                let Ok(resolved) = variant.resolution else {
+                    continue;
+                };
+                let Ok(canonical) = canonical_file(&resolved.path, "module file") else {
+                    continue;
+                };
+                let Ok(child_source) = read_rust_source(&canonical, false) else {
+                    continue;
+                };
+                let Ok(child_context) = SourceContext::for_module_file(
+                    &resolved.path,
+                    resolved.loaded_through_path_attr,
+                ) else {
+                    continue;
+                };
+                self.discover_exported_macros(&canonical, &child_context, &child_source, visited);
+            }
+        }
+
+        for call in root.descendants().filter_map(ast::MacroCall::cast) {
+            let scope = self.macro_scope_at(call.syntax(), root, &MacroScope::default());
+            if !matches!(
+                include_macro_kind(&call, root, &scope),
+                Some((IncludeKind::Source, _))
+            ) {
+                continue;
+            }
+            let Ok(argument) = static_include_argument(
+                &call,
+                self.options.edition,
+                &self.environment,
+                root,
+                call.syntax(),
+                false,
+                &scope,
+            ) else {
+                continue;
+            };
+            let included_path = context.physical_dir.join(argument);
+            let Ok(canonical) = canonical_file(&included_path, "include file") else {
+                continue;
+            };
+            let Ok(included_source) = read_rust_source(&canonical, false) else {
+                continue;
+            };
+            let include_dir = included_path
+                .parent()
+                .unwrap_or(&context.physical_dir)
+                .to_path_buf();
+            let include_context = SourceContext {
+                physical_dir: include_dir.clone(),
+                default_module_dir: include_dir,
+            };
+            self.discover_exported_macros(&canonical, &include_context, &included_source, visited);
+        }
     }
 
     fn bundle_rust_source(
@@ -222,9 +315,10 @@ impl Bundler {
         let retained_module_paths_are_stable = site.retention.module_paths;
         let retained_include_paths_are_stable = site.retention.include_paths;
         let source_positions_are_stable = site.retention.source_positions;
+        self.exported_macros.extend(exported_macro_names(root));
         let transcribers = relevant_transcribers(root);
         if transcribers.iter().any(|transcriber| {
-            let transcriber_scope = MacroScope::at(&transcriber.definition, root, macro_scope);
+            let transcriber_scope = self.macro_scope_at(&transcriber.definition, root, macro_scope);
             hidden_location_macros(&transcriber.definition)
                 .into_iter()
                 .filter(|call| call.start >= transcriber.start && call.end <= transcriber.end)
@@ -247,8 +341,51 @@ impl Bundler {
             )));
         }
 
+        for outer_call in root.descendants().filter_map(ast::MacroCall::cast) {
+            if !syntax_is_active(outer_call.syntax(), file_path).map_err(ExpansionError::fatal)? {
+                continue;
+            }
+            let Some(arguments) = outer_call.token_tree() else {
+                continue;
+            };
+            let outer_scope = self.macro_scope_at(outer_call.syntax(), root, macro_scope);
+            for hidden in hidden_macro_calls(arguments.syntax()) {
+                if hidden.arguments_are_empty
+                    && resolve_location_macro_path(
+                        &hidden.path,
+                        outer_call.syntax(),
+                        root,
+                        &outer_scope,
+                    )
+                    .is_some()
+                {
+                    if source_positions_are_stable {
+                        return Ok(source.to_owned());
+                    }
+                    return Err(ExpansionError::recoverable(format!(
+                        "location-sensitive macro inside another macro in {} cannot be moved safely",
+                        file_path.display()
+                    )));
+                }
+                if !retained_include_paths_are_stable
+                    && resolve_include_macro_path(
+                        &hidden.path,
+                        outer_call.syntax(),
+                        root,
+                        &outer_scope,
+                    )
+                    .is_some()
+                {
+                    return Err(ExpansionError::recoverable(format!(
+                        "include macro inside another macro in {} cannot be moved safely",
+                        file_path.display()
+                    )));
+                }
+            }
+        }
+
         for call in root.descendants().filter_map(ast::MacroCall::cast) {
-            let call_macro_scope = MacroScope::at(call.syntax(), root, macro_scope);
+            let call_macro_scope = self.macro_scope_at(call.syntax(), root, macro_scope);
             let Some((_, name_is_unambiguous)) =
                 location_macro_kind(&call, root, &call_macro_scope)
             else {
@@ -277,7 +414,7 @@ impl Bundler {
                 .descendants()
                 .filter_map(ast::MacroCall::cast)
                 .any(|call| {
-                    let scope = MacroScope::at(call.syntax(), root, macro_scope);
+                    let scope = self.macro_scope_at(call.syntax(), root, macro_scope);
                     include_macro_kind(&call, root, &scope).is_some()
                 })
         {
@@ -291,7 +428,7 @@ impl Bundler {
         let mut occupied_ranges = HashSet::new();
 
         for transcriber in transcribers {
-            let transcriber_scope = MacroScope::at(&transcriber.definition, root, macro_scope);
+            let transcriber_scope = self.macro_scope_at(&transcriber.definition, root, macro_scope);
             let transcriber_source = transcriber.source.clone();
             let parsed = ast::Expr::parse(&transcriber_source, self.options.edition.into());
             if !parsed.errors().is_empty() {
@@ -489,7 +626,7 @@ impl Bundler {
         }
 
         for call in root.descendants().filter_map(ast::MacroCall::cast) {
-            let call_macro_scope = MacroScope::at(call.syntax(), root, macro_scope);
+            let call_macro_scope = self.macro_scope_at(call.syntax(), root, macro_scope);
             let Some((kind, name_is_unambiguous)) =
                 location_macro_kind(&call, root, &call_macro_scope)
             else {
@@ -523,7 +660,7 @@ impl Bundler {
 
         if self.options.inline_includes {
             for call in root.descendants().filter_map(ast::MacroCall::cast) {
-                let call_macro_scope = MacroScope::at(call.syntax(), root, macro_scope);
+                let call_macro_scope = self.macro_scope_at(call.syntax(), root, macro_scope);
                 let Some((kind, name_is_unambiguous)) =
                     include_macro_kind(&call, root, &call_macro_scope)
                 else {
@@ -677,7 +814,7 @@ impl Bundler {
         let child_context =
             SourceContext::for_module_file(&resolved.path, resolved.loaded_through_path_attr)
                 .map_err(ExpansionError::recoverable)?;
-        let child_macro_scope = MacroScope::at(module.syntax(), root, macro_scope);
+        let child_macro_scope = self.macro_scope_at(module.syntax(), root, macro_scope);
         let child_module_paths_are_stable = inline_default_dir == child_context.default_module_dir;
         let child_include_paths_are_stable = child_context.physical_dir == self.bundle_dir;
         self.active_modules.push(canonical.clone());
@@ -854,6 +991,15 @@ impl Bundler {
             "module cycle detected while resolving {module_path}: {}",
             chain.join(" -> ")
         )))
+    }
+
+    fn macro_scope_at(
+        &self,
+        node: &SyntaxNode,
+        root: &SyntaxNode,
+        inherited: &MacroScope,
+    ) -> MacroScope {
+        MacroScope::at(node, root, inherited).with_defined_macros(&self.exported_macros)
     }
 
     fn checkpoint(&self) -> ExpansionCheckpoint {

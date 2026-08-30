@@ -11,10 +11,11 @@ pub(super) struct MacroTranscriber {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct HiddenLocationMacro {
+pub(super) struct HiddenMacroCall {
     pub(super) start: usize,
     pub(super) end: usize,
     pub(super) path: String,
+    pub(super) arguments_are_empty: bool,
 }
 
 pub(super) fn relevant_transcribers(root: &SyntaxNode) -> Vec<MacroTranscriber> {
@@ -69,13 +70,20 @@ pub(super) fn relevant_transcribers(root: &SyntaxNode) -> Vec<MacroTranscriber> 
     transcribers
 }
 
-pub(super) fn hidden_location_macros(root: &SyntaxNode) -> Vec<HiddenLocationMacro> {
+pub(super) fn hidden_macro_calls(root: &SyntaxNode) -> Vec<HiddenMacroCall> {
     let mut calls = Vec::new();
-    collect_hidden_location_macros(root, &mut calls);
+    collect_hidden_macro_calls(root, &mut calls);
     calls
 }
 
-fn collect_hidden_location_macros(node: &SyntaxNode, calls: &mut Vec<HiddenLocationMacro>) {
+pub(super) fn hidden_location_macros(root: &SyntaxNode) -> Vec<HiddenMacroCall> {
+    hidden_macro_calls(root)
+        .into_iter()
+        .filter(|call| call.arguments_are_empty)
+        .collect()
+}
+
+fn collect_hidden_macro_calls(node: &SyntaxNode, calls: &mut Vec<HiddenMacroCall>) {
     let elements = node.children_with_tokens().collect::<Vec<_>>();
     for (index, element) in elements.iter().enumerate() {
         let NodeOrToken::Token(bang) = element else {
@@ -100,20 +108,21 @@ fn collect_hidden_location_macros(node: &SyntaxNode, calls: &mut Vec<HiddenLocat
             continue;
         };
         let argument_text = arguments.text().to_string();
-        if argument_text.len() < 2 || !argument_text[1..argument_text.len() - 1].trim().is_empty() {
+        if argument_text.len() < 2 {
             continue;
         }
         let Some((path, start)) = location_macro_path(&elements, name_index, name) else {
             continue;
         };
-        calls.push(HiddenLocationMacro {
+        calls.push(HiddenMacroCall {
             start,
             end: byte_range(arguments.text_range()).end,
             path,
+            arguments_are_empty: argument_text[1..argument_text.len() - 1].trim().is_empty(),
         });
     }
     for child in node.children() {
-        collect_hidden_location_macros(&child, calls);
+        collect_hidden_macro_calls(&child, calls);
     }
 }
 
@@ -138,7 +147,10 @@ fn location_macro_path(
     };
     let prefix_index = separator_start.checked_sub(1)?;
     let prefix = significant.get(prefix_index)?.as_token()?;
-    if !matches!(prefix.text(), "std" | "core") {
+    if !matches!(
+        prefix.text().strip_prefix("r#").unwrap_or(prefix.text()),
+        "std" | "core"
+    ) {
         return None;
     }
     let mut start = byte_range(prefix.text_range()).start;

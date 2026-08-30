@@ -1,0 +1,12 @@
+{
+  "mustContain": [
+    "include_str!((\"data.txt\"))",
+    "include_str!(concat!((\"data\"), \".txt\"))",
+    "include_str!(concat!(1foo, \".txt\"))",
+    "include_str!(concat!(1.0foo, \".txt\"))",
+    "include_str!(\"data.txt\"foo)",
+    "include_str!(concat!('a'foo, \".txt\"))"
+  ],
+  "mustExcludeFiles": ["data.txt", "1.txt", "1.0.txt", "a.txt"],
+  "runtimeChecks": [{ "shouldCompile": false }]
+}

@@ -1,0 +1,5 @@
+{
+  "mustContain": ["include_str!(\"data.txt\")"],
+  "mustIncludeFiles": ["consumer.rs", "macros.rs", "definition.rs"],
+  "mustExcludeFiles": ["data.txt"]
+}

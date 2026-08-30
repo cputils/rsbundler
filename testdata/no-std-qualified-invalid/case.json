@@ -1,0 +1,7 @@
+{
+  "mustContain": ["std::include_str!(\"data.txt\")"],
+  "mustExcludeFiles": ["data.txt"],
+  "runtimeChecks": [
+    { "rustcArgs": ["--crate-type=lib"], "shouldCompile": false }
+  ]
+}

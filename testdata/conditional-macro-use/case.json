@@ -1,0 +1,5 @@
+{
+  "mustContain": ["mod macros {", "include_str!(\"data.txt\")"],
+  "mustIncludeFiles": ["macros.rs"],
+  "mustExcludeFiles": ["data.txt"]
+}

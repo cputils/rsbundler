@@ -2,15 +2,28 @@ use std::collections::{HashMap, HashSet};
 
 use ra_ap_syntax::{
     AstNode, AstToken, NodeOrToken, SyntaxNode, ast,
-    ast::{HasName, LiteralKind},
+    ast::{HasAttrs, HasName, LiteralKind},
 };
 
 use super::{BundledSourceKind, RustEdition};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(super) struct MacroScope {
     defined_macros: HashSet<String>,
     has_unknown_macro_import: bool,
+    std_is_available: bool,
+    core_is_available: bool,
+}
+
+impl Default for MacroScope {
+    fn default() -> Self {
+        Self {
+            defined_macros: HashSet::new(),
+            has_unknown_macro_import: false,
+            std_is_available: true,
+            core_is_available: true,
+        }
+    }
 }
 
 impl MacroScope {
@@ -18,8 +31,10 @@ impl MacroScope {
         let mut scope = inherited.clone();
         for definition in root.descendants() {
             let Some((name, textual_scope)) = ast::MacroRules::cast(definition.clone())
-                .and_then(|macro_rules| macro_rules.name())
-                .map(|name| (name, true))
+                .and_then(|macro_rules| {
+                    let textual_scope = !has_attribute(&macro_rules, "macro_export");
+                    macro_rules.name().map(|name| (name, textual_scope))
+                })
                 .or_else(|| {
                     ast::MacroDef::cast(definition.clone())
                         .and_then(|item| item.name())
@@ -31,26 +46,82 @@ impl MacroScope {
             if syntax_binding_is_visible(&definition, node, textual_scope) {
                 scope
                     .defined_macros
-                    .insert(name.syntax().text().to_string());
+                    .insert(normalize_macro_path(&name.syntax().text().to_string()));
             }
         }
         scope.has_unknown_macro_import |=
             root.descendants().filter_map(ast::Attr::cast).any(|attr| {
-                attr.meta().is_some_and(|meta| match meta {
-                    ast::Meta::PathMeta(meta) => {
-                        meta.path()
-                            .and_then(|path| path.as_single_name_ref())
-                            .is_some_and(|name| name.text() == "macro_use")
-                            && attr
-                                .syntax()
-                                .parent()
-                                .is_some_and(|owner| syntax_binding_is_visible(&owner, node, true))
-                    }
-                    _ => false,
-                })
+                attr.meta()
+                    .is_some_and(|meta| meta_contains_name(meta, "macro_use"))
+                    && attr
+                        .syntax()
+                        .parent()
+                        .is_some_and(|owner| syntax_binding_is_visible(&owner, node, true))
             });
         scope
     }
+
+    pub(super) fn with_defined_macros(mut self, names: &HashSet<String>) -> Self {
+        self.defined_macros.extend(names.iter().cloned());
+        self
+    }
+
+    pub(super) fn with_standard_crates(mut self, std: bool, core: bool) -> Self {
+        self.std_is_available = std;
+        self.core_is_available = core;
+        self
+    }
+}
+
+pub(super) fn implicit_standard_crates(root: &SyntaxNode) -> (bool, bool) {
+    let attributes = root
+        .children()
+        .filter_map(ast::Attr::cast)
+        .filter_map(|attr| attr.meta())
+        .collect::<Vec<_>>();
+    let has_attribute = |name| {
+        attributes
+            .iter()
+            .any(|meta| meta_contains_name(meta.clone(), name))
+    };
+    let has_implicit_prelude = !has_attribute("no_implicit_prelude");
+    (
+        has_implicit_prelude && !has_attribute("no_std"),
+        has_implicit_prelude,
+    )
+}
+
+pub(super) fn exported_macro_names(root: &SyntaxNode) -> impl Iterator<Item = String> {
+    root.descendants()
+        .filter_map(ast::MacroRules::cast)
+        .filter(|macro_rules| has_attribute(macro_rules, "macro_export"))
+        .filter_map(|macro_rules| macro_rules.name())
+        .map(|name| normalize_macro_path(&name.syntax().text().to_string()))
+}
+
+fn has_attribute(owner: &impl HasAttrs, name: &str) -> bool {
+    owner
+        .attrs()
+        .filter_map(|attr| attr.meta())
+        .any(|meta| meta_contains_name(meta, name))
+}
+
+fn meta_contains_name(meta: ast::Meta, name: &str) -> bool {
+    match meta {
+        ast::Meta::CfgAttrMeta(meta) => meta.metas().any(|nested| meta_contains_name(nested, name)),
+        ast::Meta::UnsafeMeta(meta) => meta
+            .meta()
+            .is_some_and(|nested| meta_contains_name(nested, name)),
+        ast::Meta::PathMeta(meta) => meta_path_contains_name(meta.path(), name),
+        ast::Meta::TokenTreeMeta(meta) => meta_path_contains_name(meta.path(), name),
+        ast::Meta::KeyValueMeta(meta) => meta_path_contains_name(meta.path(), name),
+        ast::Meta::CfgMeta(_) => false,
+    }
+}
+
+fn meta_path_contains_name(path: Option<ast::Path>, name: &str) -> bool {
+    path.and_then(|path| path.as_single_name_ref())
+        .is_some_and(|path| raw_identifier_text(path.text()) == name)
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -99,19 +170,29 @@ pub(super) fn include_macro_kind(
     scope: &MacroScope,
 ) -> Option<(IncludeKind, bool)> {
     let original_path = call.path()?.syntax().text().to_string();
-    let path = original_path.strip_prefix("::").unwrap_or(&original_path);
+    resolve_include_macro_path(&original_path, call.syntax(), root, scope)
+}
+
+pub(super) fn resolve_include_macro_path(
+    original_path: &str,
+    scope_node: &SyntaxNode,
+    root: &SyntaxNode,
+    scope: &MacroScope,
+) -> Option<(IncludeKind, bool)> {
+    let path = normalize_macro_path(original_path.strip_prefix("::").unwrap_or(original_path));
+    let path = path.as_str();
     if let Some(kind) = builtin_include_path(path) {
         let qualified = path.contains("::");
         if qualified {
             return Some((
                 kind,
-                qualified_builtin_is_unambiguous(&original_path, call.syntax(), root),
+                qualified_builtin_is_unambiguous(original_path, scope_node, root, scope),
             ));
         }
         return Some((
             kind,
             !scope.has_unknown_macro_import
-                && !macro_name_may_be_shadowed(path, call.syntax(), root, scope),
+                && !macro_name_may_be_shadowed(path, scope_node, root, scope),
         ));
     }
     if path.contains("::") {
@@ -120,7 +201,7 @@ pub(super) fn include_macro_kind(
 
     let mut bindings = Vec::new();
     let mut has_unknown_glob = false;
-    for use_item in visible_use_items(call.syntax(), root) {
+    for use_item in visible_use_items(scope_node, root) {
         if let Some(tree) = use_item.use_tree() {
             collect_use_bindings(&tree, "", &mut bindings, &mut has_unknown_glob);
         }
@@ -128,7 +209,11 @@ pub(super) fn include_macro_kind(
     let candidates = bindings
         .iter()
         .filter(|binding| binding.local == path)
-        .filter_map(|binding| builtin_include_path(&binding.full_path))
+        .filter_map(|binding| {
+            let kind = builtin_include_path(&binding.full_path)?;
+            qualified_builtin_is_unambiguous(&binding.full_path, scope_node, root, scope)
+                .then_some(kind)
+        })
         .collect::<HashSet<_>>();
     if candidates.len() != 1 {
         return None;
@@ -168,12 +253,13 @@ pub(super) fn resolve_location_macro_path(
     root: &SyntaxNode,
     scope: &MacroScope,
 ) -> Option<(LocationMacroKind, bool)> {
-    let path = original_path.strip_prefix("::").unwrap_or(original_path);
+    let path = normalize_macro_path(original_path.strip_prefix("::").unwrap_or(original_path));
+    let path = path.as_str();
     if let Some(kind) = builtin_location_macro_path(path) {
         if path.contains("::") {
             return Some((
                 kind,
-                qualified_builtin_is_unambiguous(original_path, scope_node, root),
+                qualified_builtin_is_unambiguous(original_path, scope_node, root, scope),
             ));
         }
         return Some((
@@ -196,7 +282,11 @@ pub(super) fn resolve_location_macro_path(
     let candidates = bindings
         .iter()
         .filter(|binding| binding.local == path)
-        .filter_map(|binding| builtin_location_macro_path(&binding.full_path))
+        .filter_map(|binding| {
+            let kind = builtin_location_macro_path(&binding.full_path)?;
+            qualified_builtin_is_unambiguous(&binding.full_path, scope_node, root, scope)
+                .then_some(kind)
+        })
         .collect::<HashSet<_>>();
     if candidates.len() != 1 {
         return None;
@@ -236,19 +326,27 @@ fn qualified_builtin_is_unambiguous(
     original_path: &str,
     scope_node: &SyntaxNode,
     root: &SyntaxNode,
+    scope: &MacroScope,
 ) -> bool {
-    let Some(prefix) = original_path.trim_start_matches("::").split("::").next() else {
+    let normalized_path = normalize_macro_path(original_path.trim_start_matches("::"));
+    let Some(prefix) = normalized_path.split("::").next() else {
         return false;
     };
+    if prefix == "std" && !scope.std_is_available {
+        return false;
+    }
+    if prefix == "core" && !scope.core_is_available {
+        return false;
+    }
     let scope_module = containing_module(scope_node);
     let module_shadow = root
         .descendants()
         .filter_map(ast::Module::cast)
         .any(|module| {
             containing_module(module.syntax()) == scope_module
-                && module
-                    .name()
-                    .is_some_and(|name| name.syntax().text() == prefix)
+                && module.name().is_some_and(|name| {
+                    raw_identifier_text(&name.syntax().text().to_string()) == prefix
+                })
         });
     if module_shadow {
         return false;
@@ -263,7 +361,7 @@ fn qualified_builtin_is_unambiguous(
                 .and_then(|rename| rename.name())
                 .map(|name| name.syntax().text().to_string())
                 .or_else(|| item.name_ref().map(|name| name.syntax().text().to_string()))
-                .is_some_and(|name| name == prefix)
+                .is_some_and(|name| raw_identifier_text(&name) == prefix)
         });
     if extern_crate_shadow {
         return false;
@@ -276,6 +374,17 @@ fn qualified_builtin_is_unambiguous(
         }
     }
     !has_unknown_glob && !bindings.iter().any(|binding| binding.local == prefix)
+}
+
+fn raw_identifier_text(name: &str) -> &str {
+    name.strip_prefix("r#").unwrap_or(name)
+}
+
+fn normalize_macro_path(path: &str) -> String {
+    path.split("::")
+        .map(raw_identifier_text)
+        .collect::<Vec<_>>()
+        .join("::")
 }
 
 #[derive(Debug)]
@@ -325,7 +434,7 @@ fn collect_use_bindings(
         && local != "_"
     {
         bindings.push(UseBinding {
-            full_path: full_path.trim_start_matches("::").to_owned(),
+            full_path: normalize_macro_path(full_path.trim_start_matches("::")),
             local: local.strip_prefix("r#").unwrap_or(&local).to_owned(),
         });
     }
@@ -458,26 +567,9 @@ fn eval_static_string_expression(
     }
     match parsed.tree() {
         ast::Expr::Literal(literal) => match literal.kind() {
-            LiteralKind::String(value) => value
-                .value()
-                .map(|value| value.into_owned())
-                .map_err(|error| format!("invalid path string: {error:?}")),
+            LiteralKind::String(value) => string_literal_value(&value, "path string"),
             _ => Err("path must evaluate to a string".to_owned()),
         },
-        ast::Expr::ParenExpr(paren) => eval_static_string_expression(
-            &paren
-                .expr()
-                .ok_or_else(|| "empty parenthesized path expression".to_owned())?
-                .syntax()
-                .text()
-                .to_string(),
-            edition,
-            environment,
-            source_root,
-            scope_node,
-            trust_unqualified_macros,
-            scope,
-        ),
         ast::Expr::MacroExpr(expression) => {
             let call = expression
                 .macro_call()
@@ -546,13 +638,33 @@ fn eval_static_string_expression(
 }
 
 fn eval_stringify(tree: &ast::TokenTree) -> Result<String, String> {
-    if tree
+    let left = tree
+        .left_delimiter_token()
+        .ok_or_else(|| "stringify! has no opening delimiter".to_owned())?;
+    let right = tree
+        .right_delimiter_token()
+        .ok_or_else(|| "stringify! has no closing delimiter".to_owned())?;
+    let mut saw_significant = false;
+    let mut trivia_after_significant = false;
+    for token in tree
         .syntax()
         .descendants_with_tokens()
         .filter_map(NodeOrToken::into_token)
-        .any(|token| ast::Comment::cast(token).is_some())
     {
-        return Err("stringify! paths containing comments are retained because Rust normalizes comment trivia".to_owned());
+        if token == left || token == right {
+            continue;
+        }
+        if ast::Comment::cast(token.clone()).is_some() {
+            return Err("stringify! paths containing comments are retained because Rust normalizes comment trivia".to_owned());
+        }
+        if token.kind().is_trivia() {
+            trivia_after_significant |= saw_significant;
+        } else {
+            if trivia_after_significant {
+                return Err("stringify! paths containing internal whitespace are retained because Rust normalizes token spacing".to_owned());
+            }
+            saw_significant = true;
+        }
     }
     Ok(token_tree_inner_text(tree)?.trim().to_owned())
 }
@@ -572,49 +684,27 @@ fn eval_concat_part(
     }
     match parsed.tree() {
         ast::Expr::Literal(literal) => match literal.kind() {
-            LiteralKind::String(value) => value
-                .value()
-                .map(|value| value.into_owned())
-                .map_err(|error| format!("invalid concat! string: {error:?}")),
-            LiteralKind::Char(value) => value
-                .value()
-                .map(|value| value.to_string())
-                .map_err(|error| format!("invalid concat! character: {error:?}")),
-            LiteralKind::IntNumber(value) => value
-                .value()
-                .map(|value| value.to_string())
-                .map_err(|error| format!("invalid concat! integer: {error}")),
-            LiteralKind::FloatNumber(value) => Ok(value.value_string()),
+            LiteralKind::String(value) => string_literal_value(&value, "concat! string"),
+            LiteralKind::Char(value) => char_literal_value(&value),
+            LiteralKind::IntNumber(value) => concat_integer(&value),
+            LiteralKind::FloatNumber(value) => concat_float(&value),
             LiteralKind::Bool(value) => Ok(value.to_string()),
             LiteralKind::ByteString(_) | LiteralKind::CString(_) | LiteralKind::Byte(_) => {
                 Err("byte and C string literals are not supported by concat!".to_owned())
             }
         },
-        ast::Expr::ParenExpr(paren) => eval_concat_part(
-            &paren
-                .expr()
-                .ok_or_else(|| "empty concat! argument".to_owned())?
-                .syntax()
-                .text()
-                .to_string(),
-            edition,
-            environment,
-            source_root,
-            scope_node,
-            trust_unqualified_macros,
-            scope,
-        ),
         ast::Expr::PrefixExpr(prefix) if prefix.op_kind() == Some(ast::UnaryOp::Neg) => {
             let expression = prefix
                 .expr()
                 .ok_or_else(|| "concat! negation has no operand".to_owned())?;
             match expression {
                 ast::Expr::Literal(literal) => match literal.kind() {
-                    LiteralKind::IntNumber(value) => value
-                        .value()
-                        .map(|value| format!("-{value}"))
-                        .map_err(|error| format!("invalid concat! integer: {error}")),
-                    LiteralKind::FloatNumber(value) => Ok(format!("-{}", value.value_string())),
+                    LiteralKind::IntNumber(value) => {
+                        concat_integer(&value).map(|value| format!("-{value}"))
+                    }
+                    LiteralKind::FloatNumber(value) => {
+                        concat_float(&value).map(|value| format!("-{value}"))
+                    }
                     _ => Err(format!(
                         "concat! argument {source:?} is not a negative number literal"
                     )),
@@ -639,6 +729,78 @@ fn eval_concat_part(
     }
 }
 
+fn concat_integer(value: &ast::IntNumber) -> Result<String, String> {
+    if value.suffix().is_some_and(|suffix| {
+        !matches!(
+            suffix,
+            "u8" | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "usize"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "isize"
+                | "f32"
+                | "f64"
+        )
+    }) {
+        return Err(format!("invalid concat! integer suffix in {value}"));
+    }
+    value
+        .value()
+        .map(|value| value.to_string())
+        .map_err(|error| format!("invalid concat! integer: {error}"))
+}
+
+fn concat_float(value: &ast::FloatNumber) -> Result<String, String> {
+    if value
+        .suffix()
+        .is_some_and(|suffix| !matches!(suffix, "f32" | "f64"))
+    {
+        return Err(format!("invalid concat! float suffix in {value}"));
+    }
+    Ok(value.value_string())
+}
+
+fn string_literal_value(value: &ast::String, description: &str) -> Result<String, String> {
+    if string_literal_suffix(value.text()).is_some() {
+        return Err(format!("invalid {description} suffix in {value}"));
+    }
+    value
+        .value()
+        .map(|value| value.into_owned())
+        .map_err(|error| format!("invalid {description}: {error:?}"))
+}
+
+fn string_literal_suffix(text: &str) -> Option<&str> {
+    let quote = text.rfind('"')?;
+    let mut suffix_start = quote + 1;
+    if text.starts_with('r') {
+        let opening_quote = text.find('"')?;
+        suffix_start += text[1..opening_quote]
+            .chars()
+            .take_while(|character| *character == '#')
+            .count();
+    }
+    (suffix_start < text.len()).then(|| &text[suffix_start..])
+}
+
+fn char_literal_value(value: &ast::Char) -> Result<String, String> {
+    let text = value.text();
+    let quote = text.rfind('\'').unwrap_or_default();
+    if quote + 1 < text.len() {
+        return Err(format!("invalid concat! character suffix in {value}"));
+    }
+    value
+        .value()
+        .map(|value| value.to_string())
+        .map_err(|error| format!("invalid concat! character: {error:?}"))
+}
+
 fn eval_plain_string_literal(source: &str, edition: RustEdition) -> Result<String, String> {
     let parsed = ast::Expr::parse(source.trim(), edition.into());
     if !parsed.errors().is_empty() {
@@ -646,10 +808,7 @@ fn eval_plain_string_literal(source: &str, edition: RustEdition) -> Result<Strin
     }
     match parsed.tree() {
         ast::Expr::Literal(literal) => match literal.kind() {
-            LiteralKind::String(value) => value
-                .value()
-                .map(|value| value.into_owned())
-                .map_err(|error| format!("invalid string literal: {error:?}")),
+            LiteralKind::String(value) => string_literal_value(&value, "string literal"),
             _ => Err(format!("expected a string literal, found {source:?}")),
         },
         _ => Err(format!("expected a string literal, found {source:?}")),
@@ -663,9 +822,10 @@ fn resolve_static_macro(
     trust_unqualified: bool,
     scope: &MacroScope,
 ) -> Option<&'static str> {
-    let path = original_path.strip_prefix("::").unwrap_or(original_path);
+    let path = normalize_macro_path(original_path.strip_prefix("::").unwrap_or(original_path));
+    let path = path.as_str();
     if path.contains("::") {
-        return qualified_builtin_is_unambiguous(original_path, scope_node, root)
+        return qualified_builtin_is_unambiguous(original_path, scope_node, root, scope)
             .then(|| builtin_static_macro_path(path))
             .flatten();
     }
@@ -690,7 +850,11 @@ fn resolve_static_macro(
     let candidates = bindings
         .iter()
         .filter(|binding| binding.local == path)
-        .filter_map(|binding| builtin_static_macro_path(&binding.full_path))
+        .filter_map(|binding| {
+            let canonical = builtin_static_macro_path(&binding.full_path)?;
+            qualified_builtin_is_unambiguous(&binding.full_path, scope_node, root, scope)
+                .then_some(canonical)
+        })
         .filter(|canonical| matches!(*canonical, "concat" | "env" | "stringify"))
         .collect::<HashSet<_>>();
     if candidates.len() != 1 {

@@ -43,7 +43,7 @@ Source is not printed back from an abstract syntax tree. Only the exact ranges t
 - `#[path = "..."]` and active `cfg_attr(..., path = "...")`, including their distinct nested-module rules
 - nested static `include!` files containing Rust items or one expression
 - `include_str!` with arbitrary UTF-8 text and `include_bytes!` with arbitrary bytes
-- literal, parenthesized, `concat!`, `env!`, and `stringify!` include paths
+- literal, `concat!`, `env!`, and `stringify!` include paths without comments or internal whitespace
 - string, character, integer (including non-decimal and suffixed forms), float, boolean, and negative-number literals inside `concat!`
 - qualified standard macros and explicit aliases such as `std::include_str!` and `use std::include_str as embedded`
 - direct `file!`, `line!`, and `column!` calls, including explicit standard aliases, replaced with their original values before source is moved
@@ -86,9 +86,9 @@ Some behavior cannot be reproduced completely without compiler-level macro expan
 - an arbitrary user or external macro can expand to an include or a source-location-sensitive built-in;
 - a location-sensitive macro hidden in the entry file has no enclosing file dependency that rsbundler can retain.
 
-User-defined and imported macro names are tracked conservatively. Unqualified include, static-path, or location macro calls are retained if shadowing is possible; qualified standard paths and unambiguous standard aliases can still be expanded. Parseable dependency constructs in `macro_rules!` transcribers are expanded, while context-dependent transcribers cause the enclosing dependency to be retained when moving them would be unsafe. Modules with an unknown attribute macro are likewise retained automatically. Add `// bundle` only when you are asserting that a recognized construct is safe to inline.
+User-defined and imported macro names are tracked conservatively, including discovered `#[macro_export]` definitions and direct or conditional `macro_use` attributes. Unqualified include, static-path, or location macro calls are retained if shadowing is possible; qualified standard paths and standard aliases are expanded only when their `std` or `core` prefix is available and unshadowed. Parseable dependency constructs in `macro_rules!` transcribers are expanded, while context-dependent transcribers cause the enclosing dependency to be retained when moving them would be unsafe. Modules with an unknown attribute macro are likewise retained automatically. Add `// bundle` only when you are asserting that a recognized construct is safe to inline.
 
-Direct `file!`, `line!`, and `column!` values are preserved exactly. If one is hidden in a macro transcriber, rsbundler retains the enclosing module or include instead of substituting the wrong definition-site value. At the crate entry there is no parent dependency to retain, so rsbundler leaves the entry unchanged; compiling that returned text under a different file name can still change a hidden `file!` result. Fully reproducing that case requires expanding the user macro.
+Direct `file!`, `line!`, and `column!` values are preserved exactly. If a location macro or include call is nested in another macro's input, rsbundler retains the enclosing module or include whenever moving it could change the source position or relative-path base. At the crate entry there is no parent dependency to retain, so a hidden location macro causes rsbundler to leave the entry unchanged; compiling that returned text under a different file name can still change a hidden `file!` result. Fully reproducing that case requires expanding the user macro.
 
 Retained `mod` and include constructs still depend on their source files. rsbundler retains a larger enclosing dependency whenever partial inlining would change their relative-path base, but the top-level retained paths are interpreted from the generated file's location. Put the output beside the entry file or preserve the required relative layout when using `no-bundle`, `external`, or automatic retention. A fully expanded result has no such local build-time source dependency.
 

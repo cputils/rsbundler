@@ -1,0 +1,7 @@
+{
+  "mustContain": ["embedded!(\"data.txt\")"],
+  "mustExcludeFiles": ["data.txt"],
+  "expectedSources": [
+    { "modulePath": "crate", "kind": "entry", "file": "main.rs" }
+  ]
+}
