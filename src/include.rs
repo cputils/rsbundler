@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
 use ra_ap_syntax::{
-    AstNode, AstToken, NodeOrToken, SyntaxNode, ast,
+    AstNode, AstToken, NodeOrToken, SourceFile, SyntaxNode, ast,
     ast::{HasAttrs, HasName, LiteralKind},
 };
 
+use super::cfg::cfg_predicate_expression;
 use super::{BundledSourceKind, RustEdition};
 
 #[derive(Clone, Debug)]
@@ -528,40 +529,40 @@ fn macro_name_is_defined(name: &str, scope: &MacroScope) -> bool {
     scope.defined_macros.contains(name)
 }
 
+pub(super) struct StaticIncludeContext<'a> {
+    pub(super) edition: RustEdition,
+    pub(super) environment: &'a HashMap<String, String>,
+    pub(super) logical_file_path: &'a std::path::Path,
+    pub(super) source: &'a str,
+    pub(super) source_root: &'a SyntaxNode,
+    pub(super) scope_node: &'a SyntaxNode,
+    pub(super) trust_unqualified_macros: bool,
+    pub(super) scope: &'a MacroScope,
+}
+
 pub(super) fn static_include_argument(
     call: &ast::MacroCall,
-    edition: RustEdition,
-    environment: &HashMap<String, String>,
-    source_root: &SyntaxNode,
-    scope_node: &SyntaxNode,
-    trust_unqualified_macros: bool,
-    scope: &MacroScope,
+    context: &StaticIncludeContext<'_>,
 ) -> Result<String, String> {
     let tree = call
         .token_tree()
         .ok_or_else(|| "missing macro argument".to_owned())?;
     let expression_text = token_tree_inner_text(&tree)?;
-    eval_static_string_expression(
-        &expression_text,
-        edition,
-        environment,
-        source_root,
-        scope_node,
-        trust_unqualified_macros,
-        scope,
-    )
+    let expression_offset = tree
+        .left_delimiter_token()
+        .map(|token| u32::from(token.text_range().end()) as usize)
+        .ok_or_else(|| "missing opening delimiter".to_owned())?;
+    eval_static_string_expression(&expression_text, expression_offset, context)
 }
 
 fn eval_static_string_expression(
     source: &str,
-    edition: RustEdition,
-    environment: &HashMap<String, String>,
-    source_root: &SyntaxNode,
-    scope_node: &SyntaxNode,
-    trust_unqualified_macros: bool,
-    scope: &MacroScope,
+    source_offset: usize,
+    context: &StaticIncludeContext<'_>,
 ) -> Result<String, String> {
-    let parsed = ast::Expr::parse(source.trim(), edition.into());
+    let source_offset = source_offset + source.len() - source.trim_start().len();
+    let source = source.trim();
+    let parsed = ast::Expr::parse(source, context.edition.into());
     if !parsed.errors().is_empty() {
         return Err("path is not a valid Rust expression".to_owned());
     }
@@ -585,10 +586,10 @@ fn eval_static_string_expression(
                 .ok_or_else(|| format!("{path}! has no arguments"))?;
             match resolve_static_macro(
                 &path,
-                source_root,
-                scope_node,
-                trust_unqualified_macros,
-                scope,
+                context.source_root,
+                context.scope_node,
+                context.trust_unqualified_macros,
+                context.scope,
             ) {
                 Some("concat") => {
                     let parts = split_token_tree_arguments(&tree)
@@ -596,13 +597,9 @@ fn eval_static_string_expression(
                     let mut result = String::new();
                     for part in parts {
                         result.push_str(&eval_concat_part(
-                            &part,
-                            edition,
-                            environment,
-                            source_root,
-                            scope_node,
-                            trust_unqualified_macros,
-                            scope,
+                            &part.source,
+                            source_offset + part.offset,
+                            context,
                         )?);
                     }
                     Ok(result)
@@ -613,11 +610,12 @@ fn eval_static_string_expression(
                     if !(1..=2).contains(&parts.len()) {
                         return Err("env! requires one or two string arguments".to_owned());
                     }
-                    let key = eval_plain_string_literal(&parts[0], edition)?;
+                    let key = eval_plain_string_literal(&parts[0].source, context.edition)?;
                     if parts.len() == 2 {
-                        let _ = eval_plain_string_literal(&parts[1], edition)?;
+                        let _ = eval_plain_string_literal(&parts[1].source, context.edition)?;
                     }
-                    environment
+                    context
+                        .environment
                         .get(&key)
                         .cloned()
                         .or_else(|| std::env::var(&key).ok())
@@ -628,12 +626,22 @@ fn eval_static_string_expression(
                         })
                 }
                 Some("stringify") => eval_stringify(&tree),
+                Some("file") => {
+                    require_empty_macro(&tree, "file")?;
+                    Ok(context.logical_file_path.to_string_lossy().into_owned())
+                }
+                Some("line" | "column") => {
+                    Err("path must evaluate to a string, not an integer".to_owned())
+                }
                 _ => Err(format!(
                     "path macro {path}! cannot be evaluated without macro expansion"
                 )),
             }
         }
-        _ => Err("path must be a string literal, concat!, or env! expression".to_owned()),
+        _ => Err(
+            "path must be a string literal, concat!, env!, file!, or stringify! expression"
+                .to_owned(),
+        ),
     }
 }
 
@@ -671,14 +679,12 @@ fn eval_stringify(tree: &ast::TokenTree) -> Result<String, String> {
 
 fn eval_concat_part(
     source: &str,
-    edition: RustEdition,
-    environment: &HashMap<String, String>,
-    source_root: &SyntaxNode,
-    scope_node: &SyntaxNode,
-    trust_unqualified_macros: bool,
-    scope: &MacroScope,
+    source_offset: usize,
+    context: &StaticIncludeContext<'_>,
 ) -> Result<String, String> {
-    let parsed = ast::Expr::parse(source.trim(), edition.into());
+    let source_offset = source_offset + source.len() - source.trim_start().len();
+    let source = source.trim();
+    let parsed = ast::Expr::parse(source, context.edition.into());
     if !parsed.errors().is_empty() {
         return Err(format!("invalid concat! argument {source:?}"));
     }
@@ -714,18 +720,95 @@ fn eval_concat_part(
                 )),
             }
         }
-        ast::Expr::MacroExpr(_) => eval_static_string_expression(
-            source,
-            edition,
-            environment,
-            source_root,
-            scope_node,
-            trust_unqualified_macros,
-            scope,
-        ),
+        ast::Expr::MacroExpr(expression) => {
+            let call = expression
+                .macro_call()
+                .ok_or_else(|| format!("invalid concat! argument {source:?}"))?;
+            let path = call
+                .path()
+                .ok_or_else(|| "macro path expression has no path".to_owned())?
+                .syntax()
+                .text()
+                .to_string();
+            let tree = call
+                .token_tree()
+                .ok_or_else(|| format!("{path}! has no arguments"))?;
+            let call_offset =
+                source_offset + u32::from(call.syntax().text_range().start()) as usize;
+            match resolve_static_macro(
+                &path,
+                context.source_root,
+                context.scope_node,
+                context.trust_unqualified_macros,
+                context.scope,
+            ) {
+                Some("line") => {
+                    require_empty_macro(&tree, "line")?;
+                    Ok(source_line(context.source, call_offset).to_string())
+                }
+                Some("column") => {
+                    require_empty_macro(&tree, "column")?;
+                    Ok(source_column(context.source, call_offset).to_string())
+                }
+                Some("cfg") => eval_static_cfg(&tree, context),
+                _ => eval_static_string_expression(source, source_offset, context),
+            }
+        }
         _ => Err(format!(
             "concat! argument {source:?} requires unsupported macro expansion"
         )),
+    }
+}
+
+fn require_empty_macro(tree: &ast::TokenTree, name: &str) -> Result<(), String> {
+    if token_tree_inner_text(tree)?.trim().is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{name}! requires no arguments"))
+    }
+}
+
+fn source_line(source: &str, offset: usize) -> usize {
+    source[..offset.min(source.len())]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
+}
+
+fn source_column(source: &str, offset: usize) -> usize {
+    let offset = offset.min(source.len());
+    let line_start = source[..offset].rfind('\n').map_or(0, |index| index + 1);
+    source[line_start..offset].chars().count() + 1
+}
+
+fn eval_static_cfg(
+    tree: &ast::TokenTree,
+    context: &StaticIncludeContext<'_>,
+) -> Result<String, String> {
+    let predicate_source = token_tree_inner_text(tree)?;
+    let source = format!("#[cfg({predicate_source})]\nconst _: () = ();");
+    let parsed = SourceFile::parse(&source, context.edition.into());
+    if !parsed.errors().is_empty() {
+        return Err("cfg! has an invalid predicate".to_owned());
+    }
+    let predicate = parsed
+        .tree()
+        .syntax()
+        .descendants()
+        .filter_map(ast::Attr::cast)
+        .find_map(|attribute| match attribute.meta()? {
+            ast::Meta::CfgMeta(meta) => meta.cfg_predicate(),
+            _ => None,
+        })
+        .ok_or_else(|| "cfg! has no predicate".to_owned())?;
+    let expression = cfg_predicate_expression(predicate, context.logical_file_path)?;
+    if expression.is_true() {
+        Ok("true".to_owned())
+    } else if expression.is_false() {
+        Ok("false".to_owned())
+    } else {
+        Err("cfg! path value depends on the compilation configuration".to_owned())
     }
 }
 
@@ -830,7 +913,7 @@ fn resolve_static_macro(
             .flatten();
     }
 
-    if let Some(canonical @ ("concat" | "env" | "stringify")) = builtin_static_macro_path(path) {
+    if let Some(canonical) = builtin_static_macro_path(path) {
         if trust_unqualified
             || (!scope.has_unknown_macro_import
                 && !static_macro_name_may_be_shadowed(path, canonical, scope_node, root, scope))
@@ -855,7 +938,6 @@ fn resolve_static_macro(
             qualified_builtin_is_unambiguous(&binding.full_path, scope_node, root, scope)
                 .then_some(canonical)
         })
-        .filter(|canonical| matches!(*canonical, "concat" | "env" | "stringify"))
         .collect::<HashSet<_>>();
     if candidates.len() != 1 {
         return None;
@@ -877,6 +959,10 @@ fn builtin_static_macro_path(path: &str) -> Option<&'static str> {
         "concat" | "std::concat" | "core::concat" => Some("concat"),
         "env" | "std::env" | "core::env" => Some("env"),
         "stringify" | "std::stringify" | "core::stringify" => Some("stringify"),
+        "file" | "std::file" | "core::file" => Some("file"),
+        "line" | "std::line" | "core::line" => Some("line"),
+        "column" | "std::column" | "core::column" => Some("column"),
+        "cfg" | "std::cfg" | "core::cfg" => Some("cfg"),
         _ => None,
     }
 }
@@ -921,21 +1007,39 @@ fn token_tree_inner_text(tree: &ast::TokenTree) -> Result<String, String> {
     Ok(text[left_len..text.len() - right_len].to_owned())
 }
 
-fn split_token_tree_arguments(tree: &ast::TokenTree) -> Option<Vec<String>> {
-    let mut parts = vec![String::new()];
+struct MacroArgument {
+    source: String,
+    offset: usize,
+}
+
+fn split_token_tree_arguments(tree: &ast::TokenTree) -> Option<Vec<MacroArgument>> {
+    let offset = tree
+        .left_delimiter_token()
+        .map(|token| u32::from(token.text_range().end()) as usize)?;
+    let mut parts = vec![MacroArgument {
+        source: String::new(),
+        offset,
+    }];
     for element in tree.token_trees_and_tokens() {
         match element {
             NodeOrToken::Token(token)
                 if tree.left_delimiter_token().as_ref() == Some(&token)
                     || tree.right_delimiter_token().as_ref() == Some(&token) => {}
-            NodeOrToken::Token(token) if token.text() == "," => parts.push(String::new()),
-            NodeOrToken::Token(token) => parts.last_mut()?.push_str(token.text()),
+            NodeOrToken::Token(token) if token.text() == "," => parts.push(MacroArgument {
+                source: String::new(),
+                offset: u32::from(token.text_range().end()) as usize,
+            }),
+            NodeOrToken::Token(token) => parts.last_mut()?.source.push_str(token.text()),
             NodeOrToken::Node(node) => parts
                 .last_mut()?
+                .source
                 .push_str(&node.syntax().text().to_string()),
         }
     }
-    if parts.last().is_some_and(|part| part.trim().is_empty()) {
+    if parts
+        .last()
+        .is_some_and(|part| part.source.trim().is_empty())
+    {
         parts.pop();
     }
     Some(parts)

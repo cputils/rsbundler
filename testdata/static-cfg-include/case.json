@@ -1,0 +1,9 @@
+{
+  "mustIncludeFiles": ["true.txt", "false.txt"],
+  "mustContain": [
+    "\"true branch\\n\"",
+    "\"false branch\\n\"",
+    "cfg!(target_family = \"unix\")"
+  ],
+  "mustContainCount": { "cfg!(": 1, "selected!(": 0 }
+}

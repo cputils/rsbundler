@@ -1,0 +1,9 @@
+{
+  "mustIncludeFiles": ["child.rs", "4.txt", "5.txt"],
+  "mustContain": ["\"line value\\n\"", "\"column value\\n\""],
+  "mustContainCount": {
+    "source_file!()": 1,
+    "line!()": 1,
+    "core::column!()": 1
+  }
+}

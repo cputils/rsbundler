@@ -26,6 +26,14 @@ rsbundler src/main.rs > bundled.rs
 
 `rsbundler` の実行時に Rust ツールチェーンは不要です。当然ながら、生成した `.rs` を後からコンパイルするときには Rust コンパイラが必要です。
 
+共有system libraryにも依存しない、完全静的なx86-64 Linux実行ファイルはrepository taskでbuildできます。
+
+```sh
+mise run build-static-linux-x86_64
+```
+
+成果物は `target/x86_64-unknown-linux-musl/release/rsbundler` です。Rustとthird-party libraryのコードは、1つのstatic PIE実行ファイルにlinkされます。完全静的なmusl processからCargo projectのhost proc-macro dylibはloadできないため、このbuildは自動検出した成果物をskipし、明示的な `--proc-macro` overrideをrejectして、その呼び出しを文書化済みの未展開マクロ境界内に残します。projectのproc-macro成果物をprocess内で展開する必要がある場合は通常のhost buildを使ってください。どのbuildもbundle中に外部compiler、formatter、macro server、language runtimeを起動しません。
+
 ## 動作原理
 
 1. 実行ファイルへ組み込んだ rust-analyzer の構文解析器でクレートルートを解析します。
@@ -44,7 +52,8 @@ rsbundler src/main.rs > bundled.rs
 - `#[path = "..."]` と有効な `cfg_attr(..., path = "...")`（通常とは異なる子 module の解決規則も含む）
 - Rust item 群または 1 つの式を含む、静的でネスト可能な `include!`
 - 任意の UTF-8 テキストに対する `include_str!` と、任意のバイト列に対する `include_bytes!`
-- リテラル、`concat!`、`env!`、コメントや内部空白を含まない `stringify!` からなる include パス
+- リテラル、`concat!`、`env!`、`file!`、コメントや内部空白を含まない `stringify!` からなる include パス（`concat!` 内の `line!` と `column!` も対応）
+- `all()`、`any()`、補集合によって定数へ簡約できるpredicateなど、`concat!` 内のtarget非依存な `cfg!` 値
 - `concat!` 内の文字列、文字、整数（非10進・suffix付きも含む）、浮動小数点数、真偽値、負数リテラル
 - `std::include_str!` のような修飾済み標準マクロと、`use std::include_str as embedded` のような明示的alias
 - 明示的な標準aliasを含む直接の `file!`、`line!`、`column!`（ソースを移動する前に元の値へ置換）
@@ -100,7 +109,7 @@ const SCHEMA: &str = include_str!(SCHEMA_PATH); // no-bundle
 
 ### 条件付きコンパイル
 
-rsbundler はコンパイル対象を選択せず、自身をコンパイルした際の cfg 値も使用しません。元の条件属性を残したまま、静的に解決できるすべての依存分岐を展開します。`any()` のように常に偽となる述語は、依存ファイルを読まずに除外します。
+rsbundler はコンパイル対象を選択せず、自身をコンパイルした際の cfg 値も使用しません。元の条件属性を残したまま、静的に解決できるすべての依存分岐を展開します。`any()` のように常に偽となる述語は、依存ファイルを読まずに除外します。includeパス内の `cfg!` は、boolean簡約によってcompile構成に依存しない値だと証明できる場合だけ評価し、target依存の形は変更せず残します。
 
 `cfg_attr(..., path = "...")` が1つのmoduleに対して異なるファイルを選択し得る場合、選択される各pathとデフォルトmodule pathを、互いに排他的な `#[cfg(...)]` 付きinline module分岐として出力します。これにより、Rustコンパイラが任意のcfg一式で利用できる単一のbundleになります。欠落・曖昧・循環・生成予定などの理由で安全に展開できない候補は、その条件下だけ元の外部ファイルmodule宣言として残し、ほかの候補は展開します。複数のpath属性が同時に有効になり得る重複条件も変更せず残し、診断や優先順位はrustc自身に委ねます。ネストした `cfg_attr`、条件付き属性マクロ、pathによって探索基準が変わるinline ancestor、候補ごとに異なる子moduleの基準も同様に扱います。
 
@@ -115,7 +124,7 @@ rsbundler はコンパイル対象を選択せず、自身をコンパイルし�
 
 ユーザー定義・import済みのマクロ名は、検出した `#[macro_export]` 定義と直接または条件付きの `macro_use` 属性を含めて保守的に追跡します。シャドーイングの可能性がある未修飾のinclude、静的パス、位置マクロは保持し、修飾済み標準パスと標準aliasは、その `std` / `core` prefixが利用可能でシャドーイングされていない場合だけ展開します。`macro_rules!` transcriber内のparse可能な依存構文は展開し、context依存のtranscriberは移動が危険な場合に外側の依存ごと保持します。未知の属性マクロが付いたmoduleも自動では保持します。認識された構文をinline化して安全だと利用者が保証できる場合にだけ `// bundle` を追加してください。
 
-直接の `file!`、`line!`、`column!` は元の値を正確に維持します。位置マクロまたはinclude呼び出しが別のマクロ入力内にある場合、移動によってソース位置または相対パスの基準が変わり得るmodule / includeを外側から保持します。crate entryには保持できる親依存がないため、隠れた位置マクロがあればentry自体を変更せず返します。このテキストを別のファイル名でコンパイルすると、隠れた `file!` の値だけは変わり得ます。この場合を完全に再現するにはユーザーマクロの展開が必要です。
+直接の `file!`、`line!`、`column!` は元の値を正確に維持します。標準aliasや `concat!` を介した場合も含め、認識できる静的includeパス内の同じマクロは元の呼び出し位置で評価します。位置マクロまたはinclude呼び出しがそれ以外のマクロ入力内にある場合、移動によってソース位置または相対パスの基準が変わり得るmodule / includeを外側から保持します。crate entryには保持できる親依存がないため、別の隠れた位置マクロがあればentry自体を変更せず返します。このテキストを別のファイル名でコンパイルすると、隠れた `file!` の値だけは変わり得ます。この場合を完全に再現するにはユーザーマクロの展開が必要です。
 
 保持された `mod` とinclude構文は、引き続き元のファイルへ依存します。部分的なinline化で相対パスの基準が変わる場合、rsbundlerはより外側の依存を保持しますが、トップレベルで保持されたパスは生成ファイルの配置場所を基準に解釈されます。`no-bundle`、`external`、自動保持を使う場合は、entryの隣へ出力するか、必要な相対配置を維持してください。すべて展開できた生成物には、このローカルなビルド時ソース依存はありません。
 

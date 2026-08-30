@@ -9,9 +9,9 @@ use super::cfg::{CfgExpr, syntax_is_active};
 use super::directive::{BundleDirective, bundle_directive};
 use super::edit::{ByteRange, Edit, apply_edits, byte_range, overlaps_any};
 use super::include::{
-    IncludeKind, LocationMacroKind, MacroScope, byte_string_expression, exported_macro_names,
-    implicit_standard_crates, include_macro_kind, location_macro_kind, resolve_include_macro_path,
-    resolve_location_macro_path, static_include_argument,
+    IncludeKind, LocationMacroKind, MacroScope, StaticIncludeContext, byte_string_expression,
+    exported_macro_names, implicit_standard_crates, include_macro_kind, location_macro_kind,
+    resolve_include_macro_path, resolve_location_macro_path, static_include_argument,
 };
 use super::macro_rules::{hidden_location_macros, hidden_macro_calls, relevant_transcribers};
 use super::module_resolver::{
@@ -273,12 +273,16 @@ impl<'env> Bundler<'env> {
             }
             let Ok(argument) = static_include_argument(
                 &call,
-                self.options.edition,
-                &self.environment,
-                root,
-                call.syntax(),
-                false,
-                &scope,
+                &StaticIncludeContext {
+                    edition: self.options.edition,
+                    environment: &self.environment,
+                    logical_file_path: file_path,
+                    source,
+                    source_root: root,
+                    scope_node: call.syntax(),
+                    trust_unqualified_macros: false,
+                    scope: &scope,
+                },
             ) else {
                 continue;
             };
@@ -372,6 +376,29 @@ impl<'env> Bundler<'env> {
                 continue;
             };
             let outer_scope = self.macro_scope_at(outer_call.syntax(), root, macro_scope);
+            let directive = bundle_directive(outer_call.syntax(), root, source, file_path)
+                .map_err(ExpansionError::fatal)?;
+            let evaluable_static_include = self.options.inline_includes
+                && directive != BundleDirective::NoBundle
+                && include_macro_kind(&outer_call, root, &outer_scope).is_some_and(
+                    |(_, name_is_unambiguous)| {
+                        name_is_unambiguous || directive == BundleDirective::Bundle
+                    },
+                )
+                && static_include_argument(
+                    &outer_call,
+                    &StaticIncludeContext {
+                        edition: self.options.edition,
+                        environment: &self.environment,
+                        logical_file_path,
+                        source,
+                        source_root: root,
+                        scope_node: outer_call.syntax(),
+                        trust_unqualified_macros: directive == BundleDirective::Bundle,
+                        scope: &outer_scope,
+                    },
+                )
+                .is_ok();
             for hidden in hidden_macro_calls(arguments.syntax()) {
                 if hidden.arguments_are_empty
                     && resolve_location_macro_path(
@@ -382,6 +409,9 @@ impl<'env> Bundler<'env> {
                     )
                     .is_some()
                 {
+                    if evaluable_static_include {
+                        continue;
+                    }
                     if source_positions_are_stable {
                         return Ok(source.to_owned());
                     }
@@ -689,6 +719,8 @@ impl<'env> Bundler<'env> {
                 else {
                     continue;
                 };
+                let argument_is_location_sensitive =
+                    include_argument_has_location_macro(&call, root, &call_macro_scope);
                 let directive = bundle_directive(call.syntax(), root, source, file_path)
                     .map_err(ExpansionError::fatal)?;
                 if directive == BundleDirective::NoBundle {
@@ -720,12 +752,16 @@ impl<'env> Bundler<'env> {
                 let expansion: ExpansionResult<Edit> = (|| {
                     let argument = static_include_argument(
                         &call,
-                        self.options.edition,
-                        &self.environment,
-                        root,
-                        call.syntax(),
-                        directive == BundleDirective::Bundle,
-                        &call_macro_scope,
+                        &StaticIncludeContext {
+                            edition: self.options.edition,
+                            environment: &self.environment,
+                            logical_file_path,
+                            source,
+                            source_root: root,
+                            scope_node: call.syntax(),
+                            trust_unqualified_macros: directive == BundleDirective::Bundle,
+                            scope: &call_macro_scope,
+                        },
                     )
                     .map_err(|error| {
                         ExpansionError::recoverable(format!(
@@ -767,6 +803,9 @@ impl<'env> Bundler<'env> {
                         if directive != BundleDirective::Bundle && error.is_recoverable() =>
                     {
                         self.rollback(checkpoint);
+                        if argument_is_location_sensitive && !source_positions_are_stable {
+                            return Err(error.preserved());
+                        }
                         if error.is_atomic() && !source_positions_are_stable {
                             return Err(error);
                         }
@@ -1036,6 +1075,20 @@ impl<'env> Bundler<'env> {
         self.source_file_count = checkpoint.source_count;
         self.sources.truncate(checkpoint.source_list_len);
     }
+}
+
+fn include_argument_has_location_macro(
+    call: &ast::MacroCall,
+    root: &SyntaxNode,
+    scope: &MacroScope,
+) -> bool {
+    call.token_tree().is_some_and(|arguments| {
+        hidden_location_macros(arguments.syntax())
+            .into_iter()
+            .any(|hidden| {
+                resolve_location_macro_path(&hidden.path, call.syntax(), root, scope).is_some()
+            })
+    })
 }
 
 struct IncludeSite<'a> {

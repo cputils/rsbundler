@@ -1,0 +1,5 @@
+{
+  "skipOutputCheck": true,
+  "mustContain": ["mod child;"],
+  "mustExcludeFiles": ["child.rs", "1.rs"]
+}

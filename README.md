@@ -26,6 +26,14 @@ rsbundler src/main.rs > bundled.rs
 
 The `rsbundler` executable does not need a Rust toolchain at runtime. A Rust compiler is, naturally, still required later if the generated `.rs` source is to be compiled.
 
+For a fully static x86-64 Linux executable with no shared-system-library dependency, use the repository task:
+
+```sh
+mise run build-static-linux-x86_64
+```
+
+The result is `target/x86_64-unknown-linux-musl/release/rsbundler`. Rust and third-party library code is linked into that one static PIE executable. A fully static musl process cannot load a Cargo project's host proc-macro dylibs; this build therefore skips automatically discovered artifacts and rejects explicit `--proc-macro` overrides, leaving those invocations within the documented unexpanded-macro boundaries. Use a normal host build when in-process expansion of project proc-macro artifacts is required. No rsbundler build launches an external compiler, formatter, macro server, or language runtime while bundling.
+
 ## How it works
 
 1. rsbundler parses the crate root with the rust-analyzer syntax parser embedded in the executable.
@@ -44,7 +52,8 @@ Source is not printed back from an abstract syntax tree. Only the exact ranges t
 - `#[path = "..."]` and active `cfg_attr(..., path = "...")`, including their distinct nested-module rules
 - nested static `include!` files containing Rust items or one expression
 - `include_str!` with arbitrary UTF-8 text and `include_bytes!` with arbitrary bytes
-- literal, `concat!`, `env!`, and `stringify!` include paths without comments or internal whitespace
+- literal, `concat!`, `env!`, `file!`, and `stringify!` include paths without comments or internal whitespace, including `line!` and `column!` values nested in `concat!`
+- target-independent `cfg!` values inside `concat!`, such as `all()`, `any()`, and predicates simplified to a constant by complements
 - string, character, integer (including non-decimal and suffixed forms), float, boolean, and negative-number literals inside `concat!`
 - qualified standard macros and explicit aliases such as `std::include_str!` and `use std::include_str as embedded`
 - direct `file!`, `line!`, and `column!` calls, including explicit standard aliases, replaced with their original values before source is moved
@@ -100,7 +109,7 @@ const SCHEMA: &str = include_str!(SCHEMA_PATH); // no-bundle
 
 ### Conditional compilation
 
-rsbundler never selects a compilation target and does not use the cfg values with which its own executable was compiled. It retains the original conditional attributes and expands every dependency branch that can be resolved statically. Predicates that are inherently false, such as `any()`, are skipped without reading their dependencies.
+rsbundler never selects a compilation target and does not use the cfg values with which its own executable was compiled. It retains the original conditional attributes and expands every dependency branch that can be resolved statically. Predicates that are inherently false, such as `any()`, are skipped without reading their dependencies. A `cfg!` used in an include path is evaluated only when boolean simplification proves its value independently of the compilation configuration; target-dependent forms remain unchanged.
 
 When `cfg_attr(..., path = "...")` can select different files for one module, rsbundler emits mutually exclusive `#[cfg(...)]` inline-module branches for every selected path and for the default module path. This produces one bundle that the Rust compiler can use with any cfg set. A missing, ambiguous, cyclic, generated, or otherwise unsafe candidate remains as the original out-of-line declaration only under its corresponding condition; other candidates are still expanded. If multiple path attributes can be active simultaneously, that overlap branch is retained unchanged so rustc keeps control of its own overlap diagnostics and precedence behavior. Nested `cfg_attr`, conditional attribute macros, path-changing inline ancestors, and each candidate's distinct child-module base are handled in the same way.
 
@@ -115,7 +124,7 @@ Some behavior cannot be reproduced completely without full compiler name resolut
 
 User-defined and imported macro names are tracked conservatively, including discovered `#[macro_export]` definitions and direct or conditional `macro_use` attributes. Unqualified include, static-path, or location macro calls are retained if shadowing is possible; qualified standard paths and standard aliases are expanded only when their `std` or `core` prefix is available and unshadowed. Parseable dependency constructs in `macro_rules!` transcribers are expanded, while context-dependent transcribers cause the enclosing dependency to be retained when moving them would be unsafe. Modules with an unknown attribute macro are likewise retained automatically. Add `// bundle` only when you are asserting that a recognized construct is safe to inline.
 
-Direct `file!`, `line!`, and `column!` values are preserved exactly. If a location macro or include call is nested in another macro's input, rsbundler retains the enclosing module or include whenever moving it could change the source position or relative-path base. At the crate entry there is no parent dependency to retain, so a hidden location macro causes rsbundler to leave the entry unchanged; compiling that returned text under a different file name can still change a hidden `file!` result. Fully reproducing that case requires expanding the user macro.
+Direct `file!`, `line!`, and `column!` values are preserved exactly. The same macros are evaluated at their original call sites when they form a recognized static include path, including through standard aliases and `concat!`. If a location macro or include call is nested in any other macro input, rsbundler retains the enclosing module or include whenever moving it could change the source position or relative-path base. At the crate entry there is no parent dependency to retain, so another hidden location macro causes rsbundler to leave the entry unchanged; compiling that returned text under a different file name can still change a hidden `file!` result. Fully reproducing that case requires expanding the user macro.
 
 Retained `mod` and include constructs still depend on their source files. rsbundler retains a larger enclosing dependency whenever partial inlining would change their relative-path base, but the top-level retained paths are interpreted from the generated file's location. Put the output beside the entry file or preserve the required relative layout when using `no-bundle`, `external`, or automatic retention. A fully expanded result has no such local build-time source dependency.
 
